@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         招聘自动打招呼助手（Boss直聘 / 前程无忧）
 // @namespace    https://github.com/songjingyang/boss-zhipin-auto-greet
-// @version      2.8.0
+// @version      2.8.1
 // @description  Boss 直聘自动打招呼 + VIP 自动追聊 + 前程无忧自动投递
 // @author       宋璟阳
 // @match        https://www.zhipin.com/web/geek/*
@@ -18,7 +18,7 @@
 (function () {
   "use strict";
 
-  const SCRIPT_VERSION = "2.8.0";
+  const SCRIPT_VERSION = "2.8.1";
 
   /** Boss 城市代码（逗号分隔多城市搜岗） */
   const BOSS_CITY_PRESETS = {
@@ -1036,10 +1036,20 @@
     return enabled;
   }
 
-  /** 尝试通过 VIP 接口为单个会话开启自动追聊 */
+  /**
+   * 尝试通过 VIP 接口为单个会话开启自动追聊。
+   * 候选接口第一条 setRemind 是网上公开抓包验证过的真实「优先提醒」接口
+   * （https://www.zhipin.com/wapi/zpitem/web/online/setRemind，body: securityId + source=12）；
+   * 「自动追聊」很可能是同一功能改了 UI 文案，接口地址不变，因此放在第一优先级。
+   * 其余为未经验证的猜测路径，作为兜底尝试保留。
+   */
   async function tryEnableBossAutoFollowViaApi(securityId) {
     const sid = encodeURIComponent(securityId);
     const candidates = [
+      {
+        path: "/wapi/zpitem/web/online/setRemind",
+        body: `securityId=${sid}&source=12&`,
+      },
       {
         path: "/wapi/zpitem/web/online/setAutoChat",
         body: `securityId=${sid}&source=12&`,
@@ -1058,26 +1068,35 @@
       },
     ];
 
+    const attempts = [];
     for (const item of candidates) {
       try {
-        const { data } = await bossApiRequest("POST", item.path, {
+        const { status, data } = await bossApiRequest("POST", item.path, {
           body: item.body,
           referer: "https://www.zhipin.com/web/geek/chat",
           headers: { "Content-Type": "application/x-www-form-urlencoded" },
         });
-        if (data?.code !== 0) continue;
+        if (data?.code !== 0) {
+          attempts.push(`${item.path} → HTTP${status} code=${data?.code} ${data?.message || ""}`);
+          continue;
+        }
         const ok =
           data?.zpData?.autoChatResult ??
           data?.zpData?.openResult ??
           data?.zpData?.result ??
           data?.zpData?.success ??
           data?.message === "Success";
-        if (ok === false) continue;
+        if (ok === false) {
+          attempts.push(`${item.path} → code=0 但业务结果为失败`);
+          continue;
+        }
         return { ok: true, path: item.path, data };
-      } catch {
-        /* 尝试下一个候选接口 */
+      } catch (err) {
+        attempts.push(`${item.path} → 请求异常: ${err.message}`);
       }
     }
+    // 所有候选接口均未成功：把每个尝试的结果打到日志，方便定位真正的接口地址
+    log(`追聊候选接口均未生效：\n${attempts.join("\n")}`, "warn");
     return { ok: false };
   }
 
