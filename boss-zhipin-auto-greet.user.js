@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         招聘自动打招呼助手（Boss直聘 / 前程无忧）
 // @namespace    https://github.com/songjingyang/boss-zhipin-auto-greet
-// @version      2.7.0
+// @version      2.8.0
 // @description  Boss 直聘自动打招呼 + VIP 自动追聊 + 前程无忧自动投递
 // @author       宋璟阳
 // @match        https://www.zhipin.com/web/geek/*
@@ -18,7 +18,7 @@
 (function () {
   "use strict";
 
-  const SCRIPT_VERSION = "2.7.0";
+  const SCRIPT_VERSION = "2.8.0";
 
   /** Boss 城市代码（逗号分隔多城市搜岗） */
   const BOSS_CITY_PRESETS = {
@@ -88,6 +88,11 @@
     searchCities: "101010100",
     multiKeywordSearch: true,
     pagesPerKeyword: 3,
+    // 商圈/地铁线路代码（逗号分隔，可选）：PC 端能拿到的最细地理筛选维度，
+    // 弥补 PC 网页版无法像 App 端用 GPS 做「附近职位」定位的差距。
+    // 获取方式：网页搜索结果页左上角选好商圈/地铁线路后，从地址栏 URL 复制对应参数值。
+    searchBusinessDistricts: "",
+    searchSubwayLines: "",
     // Boss VIP：打招呼后自动开启追聊（需会员）
     bossAutoFollowChat: true,
     // 前程无忧：公司性质白名单（都不勾选则不限）
@@ -192,6 +197,9 @@
         "multiKeywordSearch",
         "pagesPerKeyword",
         "bossAutoFollowChat",
+        // v2.7 新增：商圈/地铁线路细粒度地理筛选
+        "searchBusinessDistricts",
+        "searchSubwayLines",
       ].forEach((key) => {
         if (!(key in saved)) cfg[key] = DEFAULT_CONFIG[key];
       });
@@ -811,6 +819,9 @@
       "salary",
       "scale",
       "jobType",
+      // 商圈/地铁线路：比城市代码更细的地理筛选，PC 端能拿到的最接近 App 端「附近职位」的维度
+      "multiBusinessDistrict",
+      "multiSubway",
     ].forEach((key) => {
       const val = overrides[key] !== undefined ? overrides[key] : qs.get(key);
       if (val) apiParams.set(key, val);
@@ -1705,6 +1716,7 @@
     const keywords = splitKeywords(cfg.searchKeywords);
     const cities = resolveBossCityCodes(cfg.searchCities);
     const pagesPerKeyword = Math.max(1, cfg.pagesPerKeyword || 3);
+    const geoOverrides = buildBossGeoOverrides(cfg);
 
     if (!keywords.length) {
       log("未配置搜索关键词，回退到当前页面 URL 参数搜岗", "warn");
@@ -1730,6 +1742,7 @@
             await fetchBossJobsFromSearchApi(page, {
               query,
               city,
+              ...geoOverrides,
             });
           log(
             `  p${page}: ${list.length} 个，累计 ${capturedJobs.length} 个（去重后）`,
@@ -1747,15 +1760,28 @@
     }
   }
 
+  /** 从配置读取商圈/地铁线路参数，统一注入到搜索请求中 */
+  function buildBossGeoOverrides(cfg) {
+    const overrides = {};
+    const districts = splitKeywords(cfg?.searchBusinessDistricts || "").join(",");
+    const subways = splitKeywords(cfg?.searchSubwayLines || "").join(",");
+    if (districts) overrides.multiBusinessDistrict = districts;
+    if (subways) overrides.multiSubway = subways;
+    return overrides;
+  }
+
   async function fetchBossSingleQueryPages(maxPages = 5) {
     if (bossEnvBlocked) {
       await fetchBossJobsViaPagePagination(maxPages);
       return;
     }
+    const geoOverrides = buildBossGeoOverrides(loadConfig());
     log(`单关键词拉取，最多 ${maxPages} 页…`, "info");
     for (let page = 1; page <= maxPages; page++) {
-      const { list, hasMore, envBlocked } =
-        await fetchBossJobsFromSearchApi(page);
+      const { list, hasMore, envBlocked } = await fetchBossJobsFromSearchApi(
+        page,
+        geoOverrides,
+      );
       log(
         `第 ${page} 页获取 ${list.length} 个，累计 ${capturedJobs.length} 个职位`,
         "info",
@@ -1892,6 +1918,14 @@
     // Boss 打招呼强依赖 securityId，缺失的多为 DOM 残缺数据，直接跳过而非失败
     if (platform === "boss" && !job.securityId)
       return "缺少 securityId（DOM 残缺数据，无法打招呼）";
+
+    // 手动添加的职位是用户明确挑选的（如 App 端看到的独占岗位），跳过黑白名单/薪资等内容过滤，
+    // 仅保留「已打招呼」去重，避免重复打扰同一职位
+    if (job.manualAdd) {
+      if (cfg.skipGreeted && greetedSet.has(jobKey(job)))
+        return `已${meta.actionVerb}过`;
+      return null;
+    }
 
     if (platform === "job51" && job.isApplied) return "已投递";
 
@@ -2198,9 +2232,54 @@
         platform === "boss"
           ? (document.getElementById("bag-boss-auto-follow")?.checked ?? true)
           : false,
+      searchBusinessDistricts:
+        document.getElementById("bag-business-districts")?.value ?? "",
+      searchSubwayLines:
+        document.getElementById("bag-subway-lines")?.value ?? "",
     };
     saveConfig(cfg);
     return cfg;
+  }
+
+  /** 解析 App 上复制来的职位链接/ID，提取 encryptJobId / securityId / lid */
+  function parseBossJobUrl(text) {
+    const raw = String(text || "").trim();
+    if (!raw) return null;
+    let encryptJobId = "";
+    let securityId = "";
+    let lid = "";
+    try {
+      const url = new URL(raw, location.origin);
+      encryptJobId = url.pathname.match(/job_detail\/([^/?#.]+)/)?.[1] || "";
+      securityId = url.searchParams.get("securityId") || "";
+      lid = url.searchParams.get("lid") || "";
+    } catch {
+      // 不是完整 URL，视为直接粘贴的 encryptJobId
+      encryptJobId = raw.match(/^[\w-]+$/) ? raw : "";
+    }
+    if (!encryptJobId) return null;
+    return { encryptJobId, encryptId: encryptJobId, securityId, lid };
+  }
+
+  /** 手动添加 App 端发现的职位到打招呼队列（PC/App 桥接，绕开推荐算法差异） */
+  function addManualBossJob() {
+    const input = document.getElementById("bag-manual-job-input");
+    const parsed = parseBossJobUrl(input?.value);
+    if (!parsed) {
+      showToast("无法识别职位链接/ID，请检查格式", "error");
+      return;
+    }
+    if (!parsed.securityId) {
+      log(
+        "该链接缺少 securityId 参数，可能无法打招呼；建议在浏览器打开该职位详情页后，直接复制地址栏完整链接",
+        "warn",
+      );
+    }
+    ingestJobList([{ ...parsed, jobName: "（手动添加）", manualAdd: true }], "手动添加");
+    state.jobs = mergeJobs();
+    updateStats();
+    if (input) input.value = "";
+    showToast("已添加到队列，点「开始」即可处理", "success");
   }
 
   function isTargetPage() {
@@ -2377,6 +2456,22 @@
         </div>
         <label class="bag-check"><input type="checkbox" id="bag-multi-keyword" ${cfg.multiKeywordSearch !== false ? "checked" : ""}> 启用多关键词搜岗（推荐，突破推荐页枯竭）</label>
         <label class="bag-check"><input type="checkbox" id="bag-boss-auto-follow" ${cfg.bossAutoFollowChat !== false ? "checked" : ""}> VIP 自动追聊（打招呼后自动开启）</label>
+        <div class="bag-row">
+          <div>
+            <label>商圈代码（可选，逗号分隔）</label>
+            <input type="text" id="bag-business-districts" value="${cfg.searchBusinessDistricts || ""}" title="在网页搜索结果页手动选好商圈后，从地址栏 URL 复制 multiBusinessDistrict 参数值">
+          </div>
+          <div>
+            <label>地铁线路代码（可选）</label>
+            <input type="text" id="bag-subway-lines" value="${cfg.searchSubwayLines || ""}" title="同理从 URL 复制 multiSubway 参数值">
+          </div>
+        </div>
+        <div class="bag-tip" style="margin:-4px 0 8px">比城市代码更细的地理筛选，弥补 PC 端没有 App 端 GPS 定位精度的差距。</div>
+        <label>手动添加职位（粘贴 App 上看到的职位链接/ID）</label>
+        <div class="bag-row">
+          <input type="text" id="bag-manual-job-input" placeholder="https://www.zhipin.com/job_detail/xxx.html?...">
+          <button id="bag-manual-job-add" style="flex:0 0 auto;background:${meta.theme};color:#fff;border:none;border-radius:6px;padding:0 12px;cursor:pointer;">添加</button>
+        </div>
         `
         : "";
 
@@ -2483,6 +2578,14 @@
     document
       .getElementById("bag-clear")
       .addEventListener("click", clearGreetedHistory);
+    document
+      .getElementById("bag-manual-job-add")
+      ?.addEventListener("click", addManualBossJob);
+    document
+      .getElementById("bag-manual-job-input")
+      ?.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") addManualBossJob();
+      });
 
     [
       "bag-greeting",
@@ -2497,6 +2600,8 @@
       "bag-search-keywords",
       "bag-search-cities",
       "bag-pages-per-keyword",
+      "bag-business-districts",
+      "bag-subway-lines",
     ].forEach((id) => {
       document.getElementById(id)?.addEventListener("change", readPanelConfig);
     });

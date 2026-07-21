@@ -106,6 +106,12 @@ https://raw.githubusercontent.com/songjingyang/boss-zhipin-auto-greet/main/boss-
 | 跳过已处理 | 跳过已打招呼 / 已投递记录 |
 | 多关键词搜岗（Boss） | 按关键词轮询拉取，缓解推荐页枯竭 |
 | VIP 自动追聊（Boss） | 打招呼后尝试开启自动追聊（需会员） |
+| 商圈/地铁线路代码（Boss，可选） | 比城市代码更细的地理筛选，弥补 PC 端无法像 App 端用 GPS 定位「附近职位」的差距；需在网页手动选好商圈/地铁后，从地址栏 URL 复制 `multiBusinessDistrict` / `multiSubway` 参数值填入 |
+| 手动添加职位（Boss） | 粘贴在 App 上看到、PC 端搜不到的职位链接（详情页完整 URL）或 encryptJobId，加入本次打招呼队列，作为 PC/App 桥接 |
+
+### 关于 PC 网页版与 App 刷到的岗位不一致
+
+Boss 是"移动原生"设计，App 端用 GPS 精确定位、更看重实时行为信号，PC 网页版走的是相对独立的搜索链路，两端召回的职位集合本身就不完全一致，这是平台产品策略差异，并非脚本缺陷。脚本无法读取或修改 Boss 后端的推荐算法，也不会通过抓包 App 私有接口去"同步"两端数据；上面两个功能是在合规范围内尽量弥合差距的折中方案。
 
 ---
 
