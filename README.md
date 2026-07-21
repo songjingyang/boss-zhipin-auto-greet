@@ -41,11 +41,11 @@ Chrome 应用店：[Tampermonkey](https://chrome.google.com/webstore/detail/tamp
 
 仓库推送成功后，用篡改猴打开下方 Raw 地址即可安装：
 
-```text
-https://raw.githubusercontent.com/<你的用户名>/boss-zhipin-auto-greet/main/boss-zhipin-auto-greet.user.js
-```
+安装链接（点击后由篡改猴接管）：
 
-或在仓库页点击 `boss-zhipin-auto-greet.user.js` → `Raw`，浏览器会提示用篡改猴安装。
+https://raw.githubusercontent.com/songjingyang/boss-zhipin-auto-greet/main/boss-zhipin-auto-greet.user.js
+
+也可在仓库页打开 `boss-zhipin-auto-greet.user.js` → 点 `Raw`，由篡改猴提示安装。
 
 #### 方式 B：手动粘贴
 

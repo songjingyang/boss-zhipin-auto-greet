@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         招聘自动打招呼助手（Boss直聘 / 前程无忧）
-// @namespace    https://github.com/local/boss-auto-greet
+// @namespace    https://github.com/songjingyang/boss-zhipin-auto-greet
 // @version      2.6.1
 // @description  Boss 直聘自动打招呼 + VIP 自动追聊 + 前程无忧自动投递
 // @author       宋璟阳
