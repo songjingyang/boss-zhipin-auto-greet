@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         招聘自动打招呼助手（Boss直聘 / 前程无忧）
 // @namespace    https://github.com/songjingyang/boss-zhipin-auto-greet
-// @version      2.6.1
+// @version      2.7.0
 // @description  Boss 直聘自动打招呼 + VIP 自动追聊 + 前程无忧自动投递
 // @author       宋璟阳
 // @match        https://www.zhipin.com/web/geek/*
@@ -18,7 +18,7 @@
 (function () {
   "use strict";
 
-  const SCRIPT_VERSION = "2.6.1";
+  const SCRIPT_VERSION = "2.7.0";
 
   /** Boss 城市代码（逗号分隔多城市搜岗） */
   const BOSS_CITY_PRESETS = {
@@ -166,8 +166,10 @@
   };
 
   let capturedJobs = [];
-  /** Boss 搜索 API 触发风控后停用主动拉取，改从页面 DOM 采集 */
+  /** Boss 搜索 API 触发风控后停用主动拉取，改从页面 DOM 采集；冷却期后自动重试，避免一次误判永久失效 */
   let bossEnvBlocked = false;
+  let bossEnvBlockedAt = 0;
+  const BOSS_ENV_BLOCK_COOLDOWN_MS = 5 * 60 * 1000;
   const OLD_DEFAULT_BLACKLIST = "猎头,外包,驻场,信息安全,销售";
 
   // ---------- 通用工具 ----------
@@ -584,17 +586,23 @@
     return getCookie("bst") || window._PAGE?.token || "";
   }
 
+  /** 较严重的环境/账户风控：需要暂停主动请求，切到页面采集 */
   function isBossEnvError(message) {
     return /环境存在异常|环境异常|账户存在异常|异常行为|code[=:]?\s*36/i.test(
       String(message || ""),
     );
   }
 
+  /** 单纯的频率限制：退避重试即可，不必永久切换模式 */
+  function isBossRateLimitError(message) {
+    return /频繁|繁忙|稍后再试|请求过多|限流|太快/i.test(String(message || ""));
+  }
+
   function markBossEnvBlocked(reason) {
-    if (bossEnvBlocked) return;
     bossEnvBlocked = true;
+    bossEnvBlockedAt = Date.now();
     log(
-      `Boss 搜索 API 已停用（${reason}），改从页面 DOM / Vue 缓存采集职位`,
+      `Boss 搜索 API 已停用（${reason}），改从页面 DOM / Vue 缓存采集职位，${Math.round(BOSS_ENV_BLOCK_COOLDOWN_MS / 60000)} 分钟后自动重试接口`,
       "warn",
     );
     showToast("检测到环境风控，已切换为页面采集模式", "warn", 6000);
@@ -662,11 +670,16 @@
   }
 
   function parseBossJobsFromDOM() {
+    // 除精确 class 外，额外加入 [class*=] / [data-*] 模糊匹配，降低 Boss 前端改版（class 哈希化等）导致选择器失效的概率
     const selectors = [
       ".job-card-wrapper",
       "li.job-card-wrapper",
       ".job-list-box li",
       ".rec-job-list li",
+      '[class*="job-card"]',
+      '[class*="job-list"] li',
+      "[data-jobid]",
+      "[data-encryptjobid]",
     ];
     const jobs = [];
     const seen = new Set();
@@ -683,6 +696,18 @@
         seen,
       );
     });
+    if (!jobs.length) {
+      // 页面文案里能找到「12-18K」之类薪资格式，但一个职位都没采到 → 大概率是选择器过期而非真的没岗位
+      const hasSalaryText = /\d+\s*[-~]\s*\d+\s*[Kk]/.test(
+        document.body?.innerText || "",
+      );
+      if (hasSalaryText) {
+        log(
+          "页面疑似存在职位卡片，但当前选择器未命中（可能是 Boss 页面结构已更新），请反馈运行日志给脚本作者",
+          "warn",
+        );
+      }
+    }
     return jobs;
   }
 
@@ -810,7 +835,13 @@
   }
 
   async function fetchBossJobsFromSearchApi(page = 1, overrides = {}) {
-    if (bossEnvBlocked) return { list: [], hasMore: false, envBlocked: true };
+    if (bossEnvBlocked) {
+      if (Date.now() - bossEnvBlockedAt < BOSS_ENV_BLOCK_COOLDOWN_MS) {
+        return { list: [], hasMore: false, envBlocked: true };
+      }
+      log("风控冷却期已过，重新尝试调用搜索接口…", "info");
+      bossEnvBlocked = false;
+    }
     const token = getBossToken();
     if (!token) return { list: [], hasMore: false };
     const label = overrides.query ? `「${overrides.query}」` : "";
@@ -821,6 +852,8 @@
         const msg = data?.message || String(data?.code ?? "unknown");
         if (isBossEnvError(msg)) {
           markBossEnvBlocked(msg);
+        } else if (isBossRateLimitError(msg)) {
+          log(`搜索${label} p${page} 触发限流：${msg}，稍后重试`, "warn");
         } else {
           log(`搜索${label} p${page}: ${msg}`, "warn");
         }
@@ -850,25 +883,48 @@
     return combined;
   }
 
-  /** 风控模式下翻页采集当前搜索结果的更多职位 */
+  /**
+   * 查找「下一页 / 换一批 / 查看更多」类按钮。
+   * 推荐页(job-recommend)通常没有传统分页，而是无限滚动 + 换一批按钮；
+   * 用文本关键词匹配代替死记 class，更抗前端改版。
+   */
+  function findLoadMoreOrNextButton() {
+    const keywordRe = /下一页|下页|换一批|查看更多|加载更多|更多职位|猜你喜欢/;
+    const candidates = document.querySelectorAll(
+      'button, a, [role="button"], .ui-icon-arrow-right, [class*="next"], [class*="more"]',
+    );
+    for (const el of candidates) {
+      if (el.closest(".disabled, [disabled]") || el.disabled) continue;
+      if (!isVisibleEl(el)) continue;
+      const text = (el.textContent || "").trim();
+      if (keywordRe.test(text) || /next/i.test(el.className || "")) {
+        return el;
+      }
+    }
+    return null;
+  }
+
+  /** 风控/兜底模式下采集当前页职位：优先滚动加载，滚动无新增再尝试点击「下一页/换一批」 */
   async function fetchBossJobsViaPagePagination(maxPages = 3) {
-    log("页面采集模式：从当前页 DOM 读取并尝试翻页", "info");
-    await collectBossJobsFromPageOnly("当前页");
-    for (let page = 2; page <= maxPages; page++) {
-      const nextBtn = document.querySelector(
-        '.ui-icon-arrow-right, .options-pages a.next, .pagination a.next, [class*="next"]',
-      );
-      if (
-        !nextBtn ||
-        nextBtn.closest(".disabled, [disabled]") ||
-        nextBtn.disabled
-      ) {
+    log("页面采集模式：从当前页 DOM 读取并尝试滚动/翻页加载更多", "info");
+    let lastCount = (await collectBossJobsFromPageOnly("当前页")).length;
+    for (let round = 1; round <= maxPages; round++) {
+      await autoScrollJobList(2);
+      await sleep(1000);
+      const jobs = await collectBossJobsFromPageOnly(`滚动第${round}轮`);
+      if (jobs.length > lastCount) {
+        log(`滚动加载：新增 ${jobs.length - lastCount} 个职位`, "info");
+        lastCount = jobs.length;
+        continue;
+      }
+      const moreBtn = findLoadMoreOrNextButton();
+      if (!moreBtn) {
+        log("滚动到底且未找到「下一页/换一批」按钮，页面采集结束", "warn");
         break;
       }
-      log(`页面采集：翻到第 ${page} 页…`, "info");
-      safeClick(nextBtn);
-      await sleep(3000);
-      await collectBossJobsFromPageOnly(`翻页 p${page}`);
+      log(`点击「${(moreBtn.textContent || "").trim().slice(0, 8)}」尝试加载更多…`, "info");
+      safeClick(moreBtn);
+      await sleep(2500);
     }
   }
 
