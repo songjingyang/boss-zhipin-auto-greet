@@ -119,9 +119,21 @@ Boss 是"移动原生"设计，App 端用 GPS 精确定位、更看重实时行�
 
 ```text
 boss-zhipin-auto-greet/
-├── boss-zhipin-auto-greet.user.js   # 篡改猴脚本本体
-└── README.md                        # 本说明
+├── boss-zhipin-auto-greet.user.js       # 篡改猴脚本本体
+├── boss-zhipin-anti-antidebug.user.js   # 可选：反调试保护绕过（仅用于自行排查网络请求）
+└── README.md                            # 本说明
 ```
+
+## 附：DevTools 打开就自动关闭标签页
+
+Boss 直聘对调试工具做了反调试保护，常见现象是打开 F12 后标签页直接被关闭（真实调用了 `window.close()`）。排查/使用网络请求功能时，可按需安装 [`boss-zhipin-anti-antidebug.user.js`](./boss-zhipin-anti-antidebug.user.js)（同样通过篡改猴安装），它在页面最早阶段拦截 `window.close`，并附带瓦解 `debugger` 轮询、console 格式化陷阱、窗口尺寸差检测等几种常见反调试手法。
+
+先尝试 Chrome 自带的零风险方案，通常已经够用：
+
+1. DevTools → Sources 面板 → 点击 **Deactivate breakpoints**（`⌘F8` / `Ctrl+F8`），让所有 `debugger;` 语句失效
+2. DevTools 右上角 → Dock side → 弹出为独立窗口（undock），避免窗口尺寸差检测
+
+只有这两步不够时才需要装反调试脚本。这是一个持续的攻防过程，不保证 100% 有效，仅用于个人自查自己账号的网络请求，不建议用于其他用途。
 
 ---
 
