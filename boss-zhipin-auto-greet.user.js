@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         招聘自动打招呼助手（Boss直聘 / 前程无忧）
 // @namespace    https://github.com/songjingyang/boss-zhipin-auto-greet
-// @version      2.8.1
+// @version      2.9.0
 // @description  Boss 直聘自动打招呼 + VIP 自动追聊 + 前程无忧自动投递
 // @author       宋璟阳
 // @match        https://www.zhipin.com/web/geek/*
@@ -18,7 +18,7 @@
 (function () {
   "use strict";
 
-  const SCRIPT_VERSION = "2.8.1";
+  const SCRIPT_VERSION = "2.9.0";
 
   /** Boss 城市代码（逗号分隔多城市搜岗） */
   const BOSS_CITY_PRESETS = {
@@ -171,6 +171,8 @@
   };
 
   let capturedJobs = [];
+  /** 最近一次成功打招呼的 Boss 职位，供「探测追聊接口」诊断按钮复用 securityId */
+  let lastGreetedBossJob = null;
   /** Boss 搜索 API 触发风控后停用主动拉取，改从页面 DOM 采集；冷却期后自动重试，避免一次误判永久失效 */
   let bossEnvBlocked = false;
   let bossEnvBlockedAt = 0;
@@ -979,6 +981,7 @@
       if (isBossEnvError(data.message)) markBossEnvBlocked(data.message);
       throw new Error(data.message || `接口错误 code=${data.code}`);
     }
+    lastGreetedBossJob = job;
     if (cfg.greeting && data.zpData?.showGreeting) {
       await trySendBossCustomGreeting(cfg.greeting, job, cfg);
     }
@@ -1076,8 +1079,12 @@
           referer: "https://www.zhipin.com/web/geek/chat",
           headers: { "Content-Type": "application/x-www-form-urlencoded" },
         });
+        // 完整返回体（截断）打进日志，不用开 DevTools 也能看到接口真实响应，便于定位
+        const bodyPreview = JSON.stringify(data ?? {}).slice(0, 200);
         if (data?.code !== 0) {
-          attempts.push(`${item.path} → HTTP${status} code=${data?.code} ${data?.message || ""}`);
+          attempts.push(
+            `${item.path} → HTTP${status} code=${data?.code} ${data?.message || ""} | body=${bodyPreview}`,
+          );
           continue;
         }
         const ok =
@@ -1087,7 +1094,7 @@
           data?.zpData?.success ??
           data?.message === "Success";
         if (ok === false) {
-          attempts.push(`${item.path} → code=0 但业务结果为失败`);
+          attempts.push(`${item.path} → code=0 但业务结果为失败 | body=${bodyPreview}`);
           continue;
         }
         return { ok: true, path: item.path, data };
@@ -1095,9 +1102,34 @@
         attempts.push(`${item.path} → 请求异常: ${err.message}`);
       }
     }
-    // 所有候选接口均未成功：把每个尝试的结果打到日志，方便定位真正的接口地址
-    log(`追聊候选接口均未生效：\n${attempts.join("\n")}`, "warn");
+    // 所有候选接口均未成功：把每个尝试的完整结果打到日志区（页面内的 <div>，非 DevTools），
+    // 复制这段内容即可帮助定位真正的接口地址，不需要打开调试工具
+    log(`追聊候选接口均未生效，详情如下（可直接复制反馈）：\n${attempts.join("\n")}`, "warn");
     return { ok: false };
+  }
+
+  /**
+   * 独立的「探测追聊接口」入口：无需真正打招呼，直接对最近一次成功打招呼的职位
+   * 重新尝试所有候选接口并把完整结果打到日志区，用于诊断，全程不需要打开 DevTools。
+   */
+  async function probeBossAutoChatEndpoints() {
+    if (!lastGreetedBossJob?.securityId) {
+      showToast("还没有成功打过招呼的职位，先正常打一次招呼再探测", "warn");
+      return;
+    }
+    log(
+      `开始探测追聊接口（目标：${lastGreetedBossJob.brandName || ""} · ${lastGreetedBossJob.jobName || ""}）…`,
+      "info",
+    );
+    const result = await tryEnableBossAutoFollowViaApi(
+      lastGreetedBossJob.securityId,
+    );
+    if (result.ok) {
+      log(`探测成功，命中接口：${result.path}`, "success");
+      showToast(`探测成功：${result.path}`, "success", 6000);
+    } else {
+      showToast("探测完成，均未成功，详情见运行日志", "warn", 6000);
+    }
   }
 
   /** 打招呼成功后触发 VIP 自动追聊（优先提醒功能已下线） */
@@ -2475,6 +2507,7 @@
         </div>
         <label class="bag-check"><input type="checkbox" id="bag-multi-keyword" ${cfg.multiKeywordSearch !== false ? "checked" : ""}> 启用多关键词搜岗（推荐，突破推荐页枯竭）</label>
         <label class="bag-check"><input type="checkbox" id="bag-boss-auto-follow" ${cfg.bossAutoFollowChat !== false ? "checked" : ""}> VIP 自动追聊（打招呼后自动开启）</label>
+        <button id="bag-probe-autochat" style="width:100%;margin:4px 0 8px;padding:6px;border:1px solid #722ed1;border-radius:6px;background:#fff;color:#722ed1;cursor:pointer;font-size:12px;">🔍 探测追聊接口（诊断用，无需 DevTools）</button>
         <div class="bag-row">
           <div>
             <label>商圈代码（可选，逗号分隔）</label>
@@ -2600,6 +2633,9 @@
     document
       .getElementById("bag-manual-job-add")
       ?.addEventListener("click", addManualBossJob);
+    document
+      .getElementById("bag-probe-autochat")
+      ?.addEventListener("click", probeBossAutoChatEndpoints);
     document
       .getElementById("bag-manual-job-input")
       ?.addEventListener("keydown", (e) => {
