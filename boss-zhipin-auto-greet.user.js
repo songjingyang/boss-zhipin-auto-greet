@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         招聘自动打招呼助手（Boss直聘 / 前程无忧）
 // @namespace    https://github.com/songjingyang/boss-zhipin-auto-greet
-// @version      2.9.0
+// @version      2.16.2
 // @description  Boss 直聘自动打招呼 + VIP 自动追聊 + 前程无忧自动投递
 // @author       宋璟阳
 // @match        https://www.zhipin.com/web/geek/*
@@ -11,14 +11,14 @@
 // @match        https://we.51job.com/*
 // @icon         https://www.zhipin.com/favicon.ico
 // @grant        none
-// @run-at       document-idle
+// @run-at       document-start
 // @license      MIT
 // ==/UserScript==
 
 (function () {
   "use strict";
 
-  const SCRIPT_VERSION = "2.9.0";
+  const SCRIPT_VERSION = "2.16.2";
 
   /** Boss 城市代码（逗号分隔多城市搜岗） */
   const BOSS_CITY_PRESETS = {
@@ -27,8 +27,15 @@
     广州: "101280100",
     深圳: "101280600",
     杭州: "101210100",
+    天津: "101030100",
+    西安: "101110100",
+    苏州: "101190400",
+    武汉: "101200100",
+    厦门: "101230200",
+    长沙: "101250100",
     成都: "101270100",
     郑州: "101180100",
+    重庆: "101040100",
     全国: "100010000",
   };
 
@@ -69,12 +76,13 @@
   const GREETED_KEY = `${meta.storagePrefix}_greeted_jobs_v1`;
 
   const DEFAULT_CONFIG = {
-    greeting:
-      "您好，我是宋璟阳，8年前端开发经验，熟悉 React/Vue 双栈及中后台、跨端小程序开发。看到贵司「{jobName}」岗位与我的背景较匹配，方便进一步沟通吗？",
-    minSalary: 12,
-    minMaxSalary: 15,
-    maxCount: 15,
+    customGreetingEnabled: false,
+    greeting: "您好，看到贵司「{jobName}」岗位与我的背景较匹配，方便进一步沟通吗？",
+    salaryRangeMin: 20,
+    salaryRangeMax: 30,
+    maxCount: 50,
     maxFetchPages: 5,
+    autoNextPage: true,
     delayMin: 8,
     delayMax: 15,
     blacklist:
@@ -85,7 +93,7 @@
     excludeOutsourcing: false,
     // Boss 多关键词搜岗：突破推荐页岗位枯竭
     searchKeywords: "前端开发,前端工程师,Web前端,Vue,React,小程序,H5,大前端",
-    searchCities: "101010100",
+    searchCities: "北京,天津,深圳",
     multiKeywordSearch: true,
     pagesPerKeyword: 3,
     // 商圈/地铁线路代码（逗号分隔，可选）：PC 端能拿到的最细地理筛选维度，
@@ -163,6 +171,7 @@
 
   const state = {
     running: false,
+    pagesLoaded: 0,
     index: 0,
     success: 0,
     skip: 0,
@@ -170,21 +179,52 @@
     jobs: [],
   };
 
+  let panelOpen = false;
   let capturedJobs = [];
+  let networkHookStatus = () => "尚未安装";
+  const captureDiagnostics = { observed: 0, responses: 0, candidates: 0, lastPath: "", shape: "", parseErrors: 0 };
   /** 最近一次成功打招呼的 Boss 职位，供「探测追聊接口」诊断按钮复用 securityId */
   let lastGreetedBossJob = null;
-  /** Boss 搜索 API 触发风控后停用主动拉取，改从页面 DOM 采集；冷却期后自动重试，避免一次误判永久失效 */
-  let bossEnvBlocked = false;
-  let bossEnvBlockedAt = 0;
-  const BOSS_ENV_BLOCK_COOLDOWN_MS = 5 * 60 * 1000;
+  // 限制状态跨刷新保留；到期也只允许用户手动启动，不自动恢复任务。
+  const BOSS_BLOCK_KEY = `${meta.storagePrefix}_blocked_until`;
+  const BOSS_ENV_BLOCK_COOLDOWN_MS = 30 * 60 * 1000;
+  let bossBlockedUntil = Number(localStorage.getItem(BOSS_BLOCK_KEY)) || 0;
+  let bossEnvBlocked = bossBlockedUntil > Date.now();
+  let runGeneration = 0;
   const OLD_DEFAULT_BLACKLIST = "猎头,外包,驻场,信息安全,销售";
 
   // ---------- 通用工具 ----------
+
+  function parseRunLimit(value, fallback) {
+    if (value == null || String(value).trim() === "") return fallback;
+    const number = Number(value);
+    return Number.isSafeInteger(number) && number >= 0 ? number : fallback;
+  }
 
   function loadConfig() {
     try {
       const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
       const cfg = { ...DEFAULT_CONFIG, ...saved };
+      cfg.maxCount = parseRunLimit(cfg.maxCount, DEFAULT_CONFIG.maxCount);
+      // 只迁移旧默认 15，保留用户其他上限（含 0 不限）。
+      if (!saved.runLimitVersion && Number(saved.maxCount) === 15) cfg.maxCount = 50;
+      cfg.runLimitVersion = 1;
+      cfg.maxFetchPages = parseRunLimit(cfg.maxFetchPages, DEFAULT_CONFIG.maxFetchPages);
+      // 新区间独立保存，旧单值配置不再参与筛选；首次使用按 20–30K 初始化。
+      for (const key of ["salaryRangeMin", "salaryRangeMax"]) {
+        const value = Number(cfg[key]);
+        cfg[key] = Number.isFinite(value) && value >= 0 ? value : DEFAULT_CONFIG[key];
+      }
+      cfg.customGreetingEnabled = saved.customGreetingEnabled === true;
+      cfg.greeting = typeof saved.greeting === "string" ? saved.greeting : DEFAULT_CONFIG.greeting;
+      delete cfg.expectedSalary;
+      delete cfg.minSalary;
+      delete cfg.minMaxSalary;
+      if (!saved.cityPickerVersion) {
+        cfg.searchCities = saved.searchCities && saved.searchCities !== "101010100"
+          ? saved.searchCities : "北京,天津,深圳";
+        cfg.cityPickerVersion = 1;
+      }
       if (!("whitelist" in saved)) cfg.whitelist = DEFAULT_CONFIG.whitelist;
       if (
         !("blacklist" in saved) ||
@@ -212,6 +252,8 @@
   }
 
   function saveConfig(cfg) {
+    cfg.cityPickerVersion = 1;
+    cfg.runLimitVersion = 1;
     localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg));
   }
 
@@ -264,14 +306,6 @@
     return document.body || document.documentElement;
   }
 
-  function formatGreeting(template, job) {
-    return template
-      .replace(/\{jobName\}/g, job.jobName || "")
-      .replace(/\{company\}/g, job.brandName || "")
-      .replace(/\{salary\}/g, job.salaryDesc || "")
-      .replace(/\\n/g, "\n");
-  }
-
   /**
    * 将薪资片段统一换算为 k（千元/月）
    * 兼容 Boss：15-25K、15K-25K、20~35K·13薪
@@ -288,7 +322,7 @@
     return num;
   }
 
-  function parseSalaryRange(salaryDesc) {
+  function parseSalaryRange(salaryDesc, strict = false) {
     if (!salaryDesc || /面议|不限/.test(String(salaryDesc))) {
       return { min: 0, max: 0 };
     }
@@ -331,8 +365,10 @@
         singleMatch[2],
       );
       if (isAnnual && min > 0) min /= 12;
-      return { min, max: 0 };
+      return { min, max: min };
     }
+
+    if (strict) return { min: 0, max: 0 };
 
     // 兜底：从字符串中提取数字，继承全局单位
     const nums = s.match(/[\d.]+/g);
@@ -455,7 +491,13 @@
   function updateStats() {
     const el = document.getElementById("bag-stats");
     if (el) {
-      el.textContent = `进度 ${state.index}/${state.jobs.length} | 成功 ${state.success} | 跳过 ${state.skip} | 失败 ${state.fail}`;
+      const cfg = loadConfig();
+      const pageText = platform === "boss" ? ` | 页/批次 ${state.pagesLoaded}/${cfg.maxFetchPages === 0 ? "不限" : cfg.maxFetchPages}` : "";
+      const fullText = `${state.running ? "运行中" : "未运行"}${pageText} | 进度 ${state.index}/${state.jobs.length} | 成功 ${state.success}/${cfg.maxCount === 0 ? "不限" : cfg.maxCount} | 跳过 ${state.skip} | 失败 ${state.fail}`;
+      const pages = platform === "boss" ? ` · 页${state.pagesLoaded}/${cfg.maxFetchPages || "∞"}` : "";
+      el.textContent = `${state.running ? "运行中" : "未运行"}${pages} · 进度${state.index}/${state.jobs.length} · 成功${state.success}/${cfg.maxCount === 0 ? "不限" : cfg.maxCount} · 跳过${state.skip} · 失败${state.fail}`;
+      el.title = fullText;
+      el.setAttribute("aria-label", fullText);
     }
   }
 
@@ -609,13 +651,15 @@
   }
 
   function markBossEnvBlocked(reason) {
+    const alreadyBlocked = bossEnvBlocked;
     bossEnvBlocked = true;
-    bossEnvBlockedAt = Date.now();
-    log(
-      `Boss 搜索 API 已停用（${reason}），改从页面 DOM / Vue 缓存采集职位，${Math.round(BOSS_ENV_BLOCK_COOLDOWN_MS / 60000)} 分钟后自动重试接口`,
-      "warn",
-    );
-    showToast("检测到环境风控，已切换为页面采集模式", "warn", 6000);
+    bossBlockedUntil = Date.now() + BOSS_ENV_BLOCK_COOLDOWN_MS;
+    localStorage.setItem(BOSS_BLOCK_KEY, String(bossBlockedUntil));
+    stopRun();
+    if (!alreadyBlocked) {
+      log(`平台限制：${reason}。已停止请求和自动翻页，暂停至少 30 分钟；请先在网页确认账户状态。`, "warn");
+      showToast("检测到平台限制，任务已停止；刷新页面不会恢复", "warn", 6000);
+    }
   }
 
   function buildBossSearchReferer(overrides = {}, page = 1) {
@@ -641,12 +685,17 @@
     { headers = {}, body = null, overrides = {}, page = 1, referer } = {},
   ) {
     return new Promise((resolve, reject) => {
+      if (bossEnvBlocked) {
+        reject(new Error("平台限制暂停中，请稍后确认网页状态再手动启动"));
+        return;
+      }
       const xhr = new XMLHttpRequest();
       const url = path.startsWith("/")
         ? path
         : path.replace(/^https:\/\/www\.zhipin\.com/, "");
       xhr.open(method, url, true);
       xhr.withCredentials = true;
+      xhr.timeout = 20000;
       const merged = {
         ...buildBossApiHeaders(overrides, page, referer),
         ...headers,
@@ -655,11 +704,22 @@
         if (v != null && v !== "") xhr.setRequestHeader(k, v);
       });
       xhr.onload = () => {
+        if ([401, 403, 429].includes(xhr.status)) {
+          markBossEnvBlocked(`HTTP ${xhr.status}`);
+          reject(new Error(`平台限制 HTTP ${xhr.status}`));
+          return;
+        }
         let data;
         try {
           data = xhr.responseText ? JSON.parse(xhr.responseText) : null;
         } catch {
           reject(new Error(`响应解析失败 HTTP ${xhr.status}`));
+          return;
+        }
+        const reason = `${data?.message || ""} code=${data?.code ?? ""}`;
+        if (isBossEnvError(reason) || isBossRateLimitError(reason) || /验证|验证码|访问受限|上限|次数|未登录|登录失效/.test(reason)) {
+          markBossEnvBlocked(reason);
+          reject(new Error(reason));
           return;
         }
         resolve({
@@ -669,14 +729,62 @@
         });
       };
       xhr.onerror = () => reject(new Error("网络请求失败"));
+      xhr.ontimeout = () => reject(new Error("请求超时，结果未知，请先在网页确认是否已沟通"));
+      xhr.onabort = () => reject(new Error("请求已取消"));
       xhr.send(body);
     });
   }
 
+  function normalizeBossJob(item) {
+    if (!item || typeof item !== "object") return null;
+    const info = item.jobInfo || item;
+    const id = info.encryptJobId || info.encryptId || item.encryptJobId;
+    const name = info.jobName || item.jobName;
+    if (!id || !name) return null;
+    return {
+      ...item, ...info,
+      encryptJobId: String(id).replace(/\.html$/, ""),
+      jobName: name,
+      securityId: info.securityId || item.securityId || item.bossInfo?.securityId || "",
+      brandName: info.brandName || item.brandName || item.brandInfo?.brandName || "",
+      cityName: info.cityName || item.cityName || "",
+      cityCode: info.cityCode || item.cityCode || info.city || item.city || "",
+      salaryDesc: info.salaryDesc || item.salaryDesc || "",
+    };
+  }
+
   function extractBossJobsFromApiData(data) {
-    if (!data || typeof data !== "object") return [];
-    const zp = data.zpData || data.data?.zpData || data;
-    return zp?.jobList || zp?.list || zp?.jobs || data?.jobList || [];
+    // 优先保留 2.10.0 的直接列表路径，不再强制规范化已有完整字段。
+    const zp = data?.zpData || data?.data?.zpData || data;
+    const direct = zp?.jobList || zp?.list || zp?.jobs || data?.jobList;
+    if (Array.isArray(direct) && direct.some((job) => job?.jobName && (job.encryptJobId || job.encryptId))) {
+      return direct.filter((job) => job && typeof job === "object");
+    }
+    const jobs = [];
+    const seen = new WeakSet();
+    let budget = 5000;
+    const visit = (value, depth = 0) => {
+      if (!value || typeof value !== "object" || depth > 8 || budget-- <= 0 || seen.has(value)) return;
+      seen.add(value);
+      const job = normalizeBossJob(value);
+      if (job) { jobs.push(job); return; }
+      for (const child of Object.values(value)) visit(child, depth + 1);
+    };
+    visit(data);
+    return jobs;
+  }
+
+  function logCaptureDiagnostics() {
+    const d = captureDiagnostics;
+    const paths = [...new Set(performance.getEntriesByType("resource").map((entry) => {
+      try {
+        const url = new URL(entry.name);
+        return url.origin === location.origin && url.pathname.startsWith("/wapi/") ? url.pathname : "";
+      } catch { return ""; }
+    }).filter(Boolean))].slice(-6);
+    log(`监听状态：${networkHookStatus()}；经过监听的请求 ${d.observed}；网页接口路径 ${paths.join("、") || "未记录"}`, "info");
+    log(`采集诊断 v${SCRIPT_VERSION}：匹配响应 ${d.responses}，解析职位 ${d.candidates}，解析异常 ${d.parseErrors}；最近路径 ${d.lastPath || "未收到"}；结构 ${d.shape || "未知"}`, "warn");
+    log(`页面数据：组件职位 ${getBossVueJobList().length}，缓存职位 ${capturedJobs.length}，DOM 职位 ${parseBossJobsFromDOM().length}`, "info");
   }
 
   function parseBossJobsFromDOM() {
@@ -701,7 +809,7 @@
     document.querySelectorAll('a[href*="job_detail"]').forEach((linkEl) => {
       collectBossJobFromLink(
         linkEl,
-        linkEl.closest("li") || linkEl,
+        linkEl.closest(".job-card-wrapper, .job-card-box, li, [data-jobid]") || linkEl,
         jobs,
         seen,
       );
@@ -724,12 +832,13 @@
   function collectBossJobFromLink(linkEl, card, jobs, seen) {
     const href = linkEl?.href || linkEl?.getAttribute("href") || "";
     if (!href.includes("job_detail")) return;
+    if (/查看更多|更多信息|详情/.test(linkEl.textContent?.trim() || "")) return;
     let encryptJobId = "";
     let securityId = "";
     let lid = "";
     try {
       const url = new URL(href, location.origin);
-      encryptJobId = url.pathname.match(/job_detail\/([^/?#]+)/)?.[1] || "";
+      encryptJobId = (url.pathname.match(/job_detail\/([^/?#]+)/)?.[1] || "").replace(/\.html$/, "");
       securityId = url.searchParams.get("securityId") || "";
       lid = url.searchParams.get("lid") || "";
     } catch {
@@ -777,36 +886,50 @@
     if (linkEl) collectBossJobFromLink(linkEl, card, jobs, seen);
   }
 
+  // 只读取页面组件持有的职位对象，不调用组件方法或额外接口。
   function getBossVueJobList() {
-    const selectors = [
-      ".job-recommend-main",
-      ".jobs-search-page",
-      ".job-search-wrapper",
-      ".job-list-box",
-      "#wrap",
-    ];
-    for (const sel of selectors) {
-      const el = document.querySelector(sel);
-      if (!el) continue;
-      let cur = el.__vue__;
-      for (let i = 0; i < 10 && cur; i++) {
-        if (Array.isArray(cur.jobList) && cur.jobList.length)
-          return cur.jobList;
-        if (Array.isArray(cur.jobCardList) && cur.jobCardList.length)
-          return cur.jobCardList;
-        if (cur.$data?.jobList?.length) return cur.$data.jobList;
-        cur = cur.$parent || cur.parent;
+    const jobs = [];
+    const seen = new WeakSet();
+    let budget = 3000;
+    const visit = (value, depth = 0) => {
+      if (!value || typeof value !== "object" || depth > 6 || budget-- <= 0 || seen.has(value)) return;
+      if (value instanceof Node || value === window) return;
+      seen.add(value);
+      if ((value.encryptJobId || value.encryptId) && value.jobName && value.securityId) {
+        jobs.push(value);
+        return;
       }
-      cur = el.__vueParentComponent?.ctx || el.__vueParentComponent?.setupState;
-      for (let i = 0; i < 10 && cur; i++) {
-        if (Array.isArray(cur.jobList) && cur.jobList.length)
-          return cur.jobList;
-        if (Array.isArray(cur.jobCardList) && cur.jobCardList.length)
-          return cur.jobCardList;
-        cur = cur.$parent;
+      const job = normalizeBossJob(value);
+      if (job?.securityId) {
+        jobs.push(job);
+        return;
+      }
+      for (const key of Object.keys(value).slice(0, 100)) {
+        if (["parent", "root", "appContext", "proxy", "provides"].includes(key)) continue;
+        try { visit(value[key], depth + 1); } catch { /* 可选组件字段 */ }
+      }
+    };
+    const elements = new Set(document.querySelectorAll(".job-card-wrapper, .job-card-box, .job-list-box, .job-list, .jobs-search-page, #wrap, #app"));
+    // 新版卡片 class 变化时，从真实职位链接沿 DOM 父级寻找组件。
+    for (const link of [...document.querySelectorAll('a[href*="/job_detail/"]')].slice(0, 100)) {
+      let node = link;
+      for (let i = 0; node && i < 8; i++, node = node.parentElement) elements.add(node);
+    }
+    for (const el of elements) {
+      let vue2 = el.__vue__;
+      let vue3 = el.__vueParentComponent;
+      for (let i = 0; i < 8 && (vue2 || vue3); i++) {
+        try {
+          visit(vue2?.jobList); visit(vue2?.jobCardList);
+          visit(vue2?.$data); visit(vue2?.$props);
+          visit(vue3?.props); visit(vue3?.setupState); visit(vue3?.data);
+          visit(vue3?.ctx?.jobList); visit(vue3?.ctx?.jobCardList);
+        } catch { /* 不阻断其他卡片 */ }
+        vue2 = vue2?.$parent;
+        vue3 = vue3?.parent;
       }
     }
-    return null;
+    return jobs;
   }
 
   function buildBossSearchApiParams(page = 1, overrides = {}) {
@@ -848,13 +971,7 @@
   }
 
   async function fetchBossJobsFromSearchApi(page = 1, overrides = {}) {
-    if (bossEnvBlocked) {
-      if (Date.now() - bossEnvBlockedAt < BOSS_ENV_BLOCK_COOLDOWN_MS) {
-        return { list: [], hasMore: false, envBlocked: true };
-      }
-      log("风控冷却期已过，重新尝试调用搜索接口…", "info");
-      bossEnvBlocked = false;
-    }
+    if (bossEnvBlocked) return { list: [], hasMore: false, envBlocked: true };
     const token = getBossToken();
     if (!token) return { list: [], hasMore: false };
     const label = overrides.query ? `「${overrides.query}」` : "";
@@ -888,7 +1005,6 @@
 
   /** 风控模式下从当前页面 DOM / Vue 采集职位 */
   async function collectBossJobsFromPageOnly(sourceLabel) {
-    await autoScrollJobList(2);
     const domJobs = parseBossJobsFromDOM();
     const vueJobs = getBossVueJobList() || [];
     const combined = [...domJobs, ...vueJobs];
@@ -919,26 +1035,8 @@
 
   /** 风控/兜底模式下采集当前页职位：优先滚动加载，滚动无新增再尝试点击「下一页/换一批」 */
   async function fetchBossJobsViaPagePagination(maxPages = 3) {
-    log("页面采集模式：从当前页 DOM 读取并尝试滚动/翻页加载更多", "info");
-    let lastCount = (await collectBossJobsFromPageOnly("当前页")).length;
-    for (let round = 1; round <= maxPages; round++) {
-      await autoScrollJobList(2);
-      await sleep(1000);
-      const jobs = await collectBossJobsFromPageOnly(`滚动第${round}轮`);
-      if (jobs.length > lastCount) {
-        log(`滚动加载：新增 ${jobs.length - lastCount} 个职位`, "info");
-        lastCount = jobs.length;
-        continue;
-      }
-      const moreBtn = findLoadMoreOrNextButton();
-      if (!moreBtn) {
-        log("滚动到底且未找到「下一页/换一批」按钮，页面采集结束", "warn");
-        break;
-      }
-      log(`点击「${(moreBtn.textContent || "").trim().slice(0, 8)}」尝试加载更多…`, "info");
-      safeClick(moreBtn);
-      await sleep(2500);
-    }
+    // 只读已加载的卡片，不点击模糊匹配的 next/more 元素。
+    await collectBossJobsFromPageOnly("当前页");
   }
 
   async function checkBossActive(job) {
@@ -964,6 +1062,9 @@
   }
 
   async function greetBossJob(job, cfg) {
+    // 请求前再次读取最新配置，等待期间修改城市也立即生效。
+    const cityReason = checkBossCityFilter(job, loadConfig());
+    if (cityReason) throw new Error(cityReason);
     const token = getBossToken();
     if (!token) throw new Error("未获取到登录 token，请确认已登录");
     const securityId = job.securityId;
@@ -977,13 +1078,14 @@
       `/wapi/zpgeek/friend/add.json?${params.toString()}`,
       { referer: location.href },
     );
-    if (data.code !== 0) {
-      if (isBossEnvError(data.message)) markBossEnvBlocked(data.message);
-      throw new Error(data.message || `接口错误 code=${data.code}`);
+    if (!data || data.code !== 0) {
+      if (isBossEnvError(data?.message)) markBossEnvBlocked(data?.message);
+      throw new Error(data?.message || `接口错误 code=${data?.code}`);
     }
     lastGreetedBossJob = job;
-    if (cfg.greeting && data.zpData?.showGreeting) {
-      await trySendBossCustomGreeting(cfg.greeting, job, cfg);
+    if (cfg.customGreetingEnabled && cfg.greeting.trim()) {
+      if (data.zpData?.showGreeting) await tryCustomGreeting(job, cfg);
+      else log("网站未提供自定义招呼入口，本次未发送自定义内容", "warn");
     }
     if (cfg.bossAutoFollowChat) {
       await tryEnableBossVipChatFeatures(job, data, cfg);
@@ -1151,26 +1253,6 @@
         `追聊接口未确认成功（已传 openAutoChat=1）：${job.brandName || ""} · ${job.jobName || ""}`,
         "warn",
       );
-    }
-  }
-
-  async function trySendBossCustomGreeting(greetingTemplate, job, cfg) {
-    await sleep(1500);
-    const dialog = document.querySelector(".greet-boss-dialog");
-    if (!dialog?.__vue__) return;
-    try {
-      if (cfg?.bossAutoFollowChat) tryEnableBossAutoFollowInDialog();
-      const vue = dialog.__vue__;
-      const text = formatGreeting(greetingTemplate, job);
-      if ("greetContent" in vue) vue.greetContent = text;
-      if ("content" in vue) vue.content = text;
-      if ("message" in vue) vue.message = text;
-      if (typeof vue.submitAction === "function") vue.submitAction();
-      else if (typeof vue.confirmAction === "function") vue.confirmAction();
-      await sleep(800);
-      if (typeof vue.closeAction === "function") vue.closeAction();
-    } catch {
-      /* 弹窗结构变化时静默失败 */
     }
   }
 
@@ -1413,6 +1495,11 @@
 
   /** 查找包含「投递成功」的可见弹窗 */
   function findJob51SuccessPopup() {
+    // 当前 PC 站的成功提示有专用容器，优先识别，避免选中外围遮罩。
+    for (const wrapper of document.querySelectorAll(".el-dialog__wrapper.success-popup")) {
+      const dialog = wrapper.querySelector(".el-dialog");
+      if (dialog && isVisibleEl(wrapper) && isVisibleEl(dialog) && /投递成功/.test(dialog.textContent || "")) return dialog;
+    }
     const popupSelectors = [
       ".van-popup",
       ".van-dialog",
@@ -1431,44 +1518,30 @@
     return null;
   }
 
-  /** 在弹窗内查找关闭按钮（右上角 X） */
+  /** 关闭入口可能是内容框的兄弟节点，只匹配有关闭语义且靠近右上角的元素。 */
   function findCloseButtonInPopup(popup) {
     if (!popup) return null;
-    const iconSelectors = [
-      ".van-popup__close-icon",
-      ".van-icon-cross",
-      ".van-dialog__close",
-      ".el-dialog__close",
-      ".el-message-box__close",
-      ".icon-close",
-      '[aria-label="Close"]',
-      '[aria-label="关闭"]',
-      'i[class*="close"]',
-      'button[class*="close"]',
-    ];
-    for (const sel of iconSelectors) {
-      const btn = popup.querySelector(sel);
-      if (btn && isVisibleEl(btn)) return btn;
+    const wrapper = popup.closest(".el-dialog__wrapper.success-popup");
+    const exactClose = wrapper?.querySelector('.el-dialog__body > img.close-button[role="button"]');
+    if (exactClose && isVisibleEl(exactClose)) return exactClose;
+    const selector = '[aria-label="Close"], [aria-label="关闭"], [title="关闭"], [class*="close"], [class*="Close"], [class*="cross"], img[alt="关闭"]';
+    const candidates = new Set([...popup.querySelectorAll(selector), ...document.querySelectorAll(selector)]);
+    // 文本 × 也可能没有 class。
+    for (const el of document.querySelectorAll("button, a, i, span")) {
+      if (/^[×✕✖]$/.test((el.textContent || "").trim())) candidates.add(el);
     }
-    // 兜底：弹窗右上角小尺寸可点击元素（51job 投递成功弹窗的 X）
-    const popupRect = popup.getBoundingClientRect();
-    for (const el of popup.querySelectorAll("i, span, button, div, a")) {
-      if (!isVisibleEl(el)) continue;
-      const text = (el.textContent || "").trim();
-      const cls = String(el.className || "");
-      if (/^(×|✕|X|x)$/.test(text) || /close|cross|关闭/i.test(cls)) return el;
+    const rect = popup.getBoundingClientRect();
+    const ranked = [];
+    for (const el of candidates) {
+      if (el.closest("#bag-panel, #bag-fab") || !isVisibleEl(el)) continue;
       const r = el.getBoundingClientRect();
-      if (
-        r.width > 0 &&
-        r.width <= 48 &&
-        r.height <= 48 &&
-        r.top <= popupRect.top + 72 &&
-        r.right >= popupRect.right - 72
-      ) {
-        return el;
-      }
+      if (r.width > 80 || r.height > 80) continue;
+      const distance = Math.hypot((r.left + r.right) / 2 - rect.right, (r.top + r.bottom) / 2 - rect.top);
+      if (!popup.contains(el) && distance > 110) continue;
+      ranked.push({ el, distance });
     }
-    return null;
+    ranked.sort((a, b) => a.distance - b.distance);
+    return ranked[0]?.el || null;
   }
 
   /** 处理投递确认弹窗（确认投递 / 确定 等） */
@@ -1483,6 +1556,7 @@
     ];
     for (let i = 0; i < 10; i++) {
       await sleep(400);
+      if (findJob51SuccessPopup()) return;
       const dialogs = document.querySelectorAll(
         '.van-popup, .el-dialog, .el-message-box, [role="dialog"]',
       );
@@ -1505,40 +1579,33 @@
 
   /** 关闭「投递成功」弹窗（含 QR 码推广页） */
   async function handleJob51SuccessPopup(maxWaitMs = 10000) {
-    const start = Date.now();
-    while (Date.now() - start < maxWaitMs) {
-      const popup = findJob51SuccessPopup();
-      if (popup) {
-        log("检测到投递成功弹窗，正在关闭…", "info");
-        const closeBtn = findCloseButtonInPopup(popup);
-        if (closeBtn) {
-          safeClick(closeBtn);
-          await sleep(700);
-          if (!findJob51SuccessPopup()) return true;
-        }
-        // 兜底：点击遮罩层
-        const overlay = document.querySelector(
-          ".van-overlay, .van-popup__overlay, .el-overlay",
-        );
-        if (overlay && isVisibleEl(overlay)) {
-          safeClick(overlay);
-          await sleep(500);
-          if (!findJob51SuccessPopup()) return true;
-        }
-        // 兜底：ESC
-        document.dispatchEvent(
-          new KeyboardEvent("keydown", {
-            key: "Escape",
-            code: "Escape",
-            bubbles: true,
-          }),
-        );
-        await sleep(500);
-        if (!findJob51SuccessPopup()) return true;
-      }
+    const deadline = Date.now() + maxWaitMs;
+    let popup = findJob51SuccessPopup();
+    while (!popup && Date.now() < deadline) {
       await sleep(300);
+      popup = findJob51SuccessPopup();
     }
-    return !findJob51SuccessPopup();
+    if (!popup) return { confirmed: false, closed: true };
+    log("已确认投递成功，尝试关闭提示弹窗…", "info");
+    // 最多尝试三次，不移除网站 DOM，不反复点击遮罩。
+    for (let attempt = 0; attempt < 3; attempt++) {
+      popup = findJob51SuccessPopup();
+      if (!popup) return { confirmed: true, closed: true };
+      const closeBtn = findCloseButtonInPopup(popup);
+      if (closeBtn) {
+        // 关闭图标本身绑定 click；只触发一次，避免 safeClick 的双重点击与滚动。
+        if (typeof closeBtn.click === "function") closeBtn.click();
+        else closeBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      }
+      else if (attempt === 0) {
+        popup.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true }));
+      } else break;
+      for (let wait = 0; wait < 4; wait++) {
+        await sleep(200);
+        if (!findJob51SuccessPopup()) return { confirmed: true, closed: true };
+      }
+    }
+    return { confirmed: true, closed: !findJob51SuccessPopup() };
   }
 
   /** 统一处理 51job 投递相关弹窗 */
@@ -1596,6 +1663,10 @@
 
   async function greetJob51Job(job, cfg) {
     if (job.isApplied) throw new Error("已投递");
+    if (findJob51SuccessPopup()) {
+      const previous = await handleJob51SuccessPopup(0);
+      if (!previous.closed) throw new Error("成功弹窗未关闭，请手动关闭后再开始");
+    }
     let card = await ensureJob51CardVisible(job);
     if (!card) {
       throw new Error("当前页面未找到该职位，请确认在搜索结果页且页面已加载");
@@ -1604,25 +1675,49 @@
     if (!applyBtn) throw new Error("未找到投递按钮（可能已投递）");
     safeClick(applyBtn);
     await sleep(1200);
-    // 先填附言，再确认投递，最后关闭成功弹窗
-    if (cfg.greeting) {
-      await tryFillJob51CoverLetter(cfg.greeting, job);
-    }
+    if (cfg.customGreetingEnabled && cfg.greeting.trim()) await tryCustomGreeting(job, cfg);
+    // 确认投递后关闭成功弹窗。
     await handleJob51ApplyConfirmPopup();
-    await handleJob51SuccessPopup();
-    return { success: true };
+    const popupResult = await handleJob51SuccessPopup();
+    if (!popupResult.confirmed) throw new Error("未确认投递结果，请在网页核实后再开始");
+    return { success: true, popupBlocked: !popupResult.closed };
   }
 
-  async function tryFillJob51CoverLetter(template, job) {
-    await sleep(800);
-    const textarea = document.querySelector(
-      '.van-popup textarea, .el-dialog textarea, .el-message-box textarea, textarea[placeholder*="附言"], textarea[placeholder*="留言"]',
-    );
-    if (!textarea) return;
-    const text = formatGreeting(template, job);
-    textarea.value = text;
-    textarea.dispatchEvent(new Event("input", { bubbles: true }));
-    textarea.dispatchEvent(new Event("change", { bubbles: true }));
+  async function tryCustomGreeting(job, cfg) {
+    const text = cfg.greeting.replace(/\{jobName\}/g, job.jobName || "")
+      .replace(/\{company\}/g, job.brandName || "")
+      .replace(/\{salary\}/g, job.salaryDesc || "").replace(/\\n/g, "\n");
+    try {
+      await sleep(800);
+      if (platform === "boss") {
+        const dialog = document.querySelector(".greet-boss-dialog");
+        const vue = dialog?.__vue__;
+        const field = vue && ["greetContent", "content", "message"].find((key) => key in vue);
+        const submit = vue && (vue.submitAction || vue.confirmAction);
+        if (!dialog || !isVisibleEl(dialog) || !field || typeof submit !== "function") {
+          log("未找到可用的自定义招呼弹窗，本次未发送自定义内容", "warn");
+          return;
+        }
+        vue[field] = text;
+        await submit.call(vue);
+        log("已尝试提交自定义招呼，实际送达请在网站消息中核实", "info");
+      } else {
+        const textarea = [...document.querySelectorAll('.van-popup textarea, .el-dialog textarea, .el-message-box textarea, textarea[placeholder*="附言"], textarea[placeholder*="留言"]')]
+          .find((el) => isVisibleEl(el) && !el.disabled && !el.readOnly && !el.closest("#bag-panel"));
+        if (!textarea) {
+          log("投递弹窗没有可用的附言框，本次未填写自定义内容", "warn");
+          return;
+        }
+        const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+        if (setter) setter.call(textarea, text);
+        else textarea.value = text;
+        textarea.dispatchEvent(new Event("input", { bubbles: true }));
+        textarea.dispatchEvent(new Event("change", { bubbles: true }));
+        log("已填写投递附言，实际提交结果以网站为准", "info");
+      }
+    } catch {
+      log("自定义内容处理失败，继续正常投递；请在网站核实", "warn");
+    }
   }
 
   // ---------- 平台路由 ----------
@@ -1646,9 +1741,9 @@
   function mergeJobs() {
     const map = new Map();
     const sources = [
-      ...capturedJobs,
-      ...(getVueJobList() || []),
       ...parseJobsFromDOM(),
+      ...(getVueJobList() || []),
+      ...capturedJobs,
     ];
     sources.forEach((job) => upsertJob(map, job));
     return [...map.values()];
@@ -1656,36 +1751,36 @@
 
   function hookNetworkForJobs() {
     if (window.__bagNetworkHooked__) return;
-    // 等页面安全脚本初始化后再 hook，降低被检测为篡改环境的概率
-    if (platform === "boss" && document.readyState === "loading") {
-      document.addEventListener("DOMContentLoaded", hookNetworkForJobs, {
-        once: true,
-      });
-      return;
-    }
     window.__bagNetworkHooked__ = true;
 
     const jobApiPattern =
       platform === "job51"
         ? /search-pc|job\/search|deliver|apply|resume/i
-        : /joblist|job\/list|search\/job|recommend/i;
+        : /\/wapi\//i;
 
     const handleJobResponse = (url, text) => {
       if (!jobApiPattern.test(url)) return;
       try {
+        if (platform === "boss" && new URL(url, location.origin).origin !== location.origin) return;
+        captureDiagnostics.responses++;
+        try { captureDiagnostics.lastPath = new URL(url, location.origin).pathname; } catch { captureDiagnostics.lastPath = "无法解析路径"; }
         const data = JSON.parse(text);
+        captureDiagnostics.shape = [data, data?.zpData, data?.data].map((part) =>
+          part && typeof part === "object" ? Object.keys(part).slice(0, 15).join(",") : typeof part).join(" / ");
         const list = extractJobsFromApiData(data);
+        captureDiagnostics.candidates += list.length;
         if (list.length) ingestJobList(list, "接口");
       } catch {
-        /* ignore */
+        captureDiagnostics.parseErrors++;
       }
     };
 
     const origFetch = window.fetch;
     const hookedFetch = async function (...args) {
+      captureDiagnostics.observed++;
       const resp = await origFetch.apply(this, args);
       try {
-        const url = typeof args[0] === "string" ? args[0] : args[0]?.url || "";
+        const url = typeof args[0] === "string" ? args[0] : args[0] instanceof URL ? args[0].href : args[0]?.url || "";
         if (jobApiPattern.test(url)) {
           resp
             .clone()
@@ -1705,6 +1800,7 @@
     const origOpen = XMLHttpRequest.prototype.open;
     const origSend = XMLHttpRequest.prototype.send;
     const patchedOpen = function (method, url, ...rest) {
+      captureDiagnostics.observed++;
       this._bagUrl = String(url);
       return origOpen.call(this, method, url, ...rest);
     };
@@ -1713,12 +1809,17 @@
 
     const patchedSend = function (...args) {
       this.addEventListener("load", function () {
-        handleJobResponse(this._bagUrl || "", this.responseText);
-      });
+        try {
+          const text = this.responseType === "json" ? JSON.stringify(this.response)
+            : (!this.responseType || this.responseType === "text") ? this.responseText : "";
+          handleJobResponse(this._bagUrl || "", text);
+        } catch { /* 不影响网页请求 */ }
+      }, { once: true });
       return origSend.apply(this, args);
     };
     patchedSend.toString = () => origSend.toString();
     XMLHttpRequest.prototype.send = patchedSend;
+    networkHookStatus = () => `fetch ${window.fetch === hookedFetch ? "有效" : "已被替换"} / XHR ${XMLHttpRequest.prototype.open === patchedOpen && XMLHttpRequest.prototype.send === patchedSend ? "有效" : "已被替换"}`;
   }
 
   function getJobListContainer() {
@@ -1887,6 +1988,17 @@
 
   async function scanAndCollectJobs(maxWaitMs = 20000) {
     const cfg = loadConfig();
+    if (platform === "boss") {
+      await collectBossJobsFromPageOnly("当前页");
+      // 开始已包含手动采集动作；给网页尚在完成的正常请求留出时间。
+      const deadline = Date.now() + Math.min(maxWaitMs, 5000);
+      let jobs = mergeJobs();
+      while (!jobs.some((job) => job.securityId) && Date.now() < deadline) {
+        await sleep(500);
+        jobs = mergeJobs();
+      }
+      return jobs;
+    }
     const start = Date.now();
     let lastCount = 0;
     while (Date.now() - start < maxWaitMs) {
@@ -1908,12 +2020,62 @@
     return mergeJobs();
   }
 
+  async function loadNextBossPage() {
+    const generation = runGeneration;
+    const active = () => state.running && generation === runGeneration && !bossEnvBlocked;
+    const cfg = loadConfig();
+    const known = new Set(state.jobs.map(jobKey));
+    const appendFresh = () => {
+      const fresh = mergeJobs().filter((job) => job.securityId && !known.has(jobKey(job)));
+      if (!fresh.length) return false;
+      state.jobs.push(...fresh);
+      log(`新增 ${fresh.length} 个完整职位，继续处理`, "success");
+      return true;
+    };
+    if (!active()) return false;
+    if (appendFresh()) return true;
+    if (!cfg.autoNextPage) { log("自动翻页已关闭", "info"); return false; }
+    if (cfg.maxFetchPages > 0 && state.pagesLoaded >= cfg.maxFetchPages) {
+      log(`已达本次页数上限 ${cfg.maxFetchPages}`, "warn");
+      return false;
+    }
+    // 只点击分页控件，不匹配全站 next/more 链接。
+    const candidates = [...document.querySelectorAll('.options-pages a, .pagination a, .pagination button, .ui-pagination a, .ui-pagination button, button[aria-label="下一页"], a[aria-label="下一页"]')];
+    const next = candidates.find((el) => isVisibleEl(el) &&
+      !el.closest('.disabled, [disabled], [aria-disabled="true"]') &&
+      (/^(下一页|下页|›|»|>)$/.test(el.textContent.trim()) || el.matches('.next, [aria-label="下一页"]') || el.querySelector('.ui-icon-arrow-right')));
+    log(next ? "当前页已处理完，等待后自动翻页…" : "当前批次已处理完，等待后滚动加载更多…", "info");
+    await sleep(Math.max(8, Number(cfg.delayMin) || 8) * 1000);
+    if (!active()) return false;
+    if (next) {
+      // 常规分页由网站处理；遇到整页导航不会跨刷新自动恢复任务。
+      safeClick(next);
+    } else {
+      const container = getJobListContainer();
+      if (container) container.scrollTop = container.scrollHeight;
+      window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "smooth" });
+    }
+    const deadline = Date.now() + 12000;
+    while (active() && Date.now() < deadline) {
+      await sleep(500);
+      if (!active()) return false;
+      if (appendFresh()) { state.pagesLoaded++; updateStats(); return true; }
+    }
+    if (active()) {
+      log("翻页后未取得新的完整职位，已停止，避免反复翻页或空跑", "warn");
+      logCaptureDiagnostics();
+    }
+    return false;
+  }
+
   async function loadMoreJobsIfNeeded() {
+    if (platform === "boss" && bossEnvBlocked) return false;
     if (state.index < state.jobs.length) return true;
+    if (platform === "boss") return loadNextBossPage();
     const cfg = loadConfig();
     const currentPageCount = Math.ceil(state.jobs.length / 30) || 1;
     const nextPage = currentPageCount + 1;
-    const maxPages = (cfg.maxFetchPages || 5) * 2;
+    const maxPages = cfg.maxFetchPages === 0 ? Infinity : cfg.maxFetchPages * 2;
 
     if (nextPage <= maxPages && !(platform === "boss" && bossEnvBlocked)) {
       log(`当前批次已处理完，拉取第 ${nextPage} 页…`, "info");
@@ -1962,9 +2124,40 @@
     return false;
   }
 
+  // 使用岗位城市字段，绝不以公司名称或当前搜索页城市推断工作地点。
+  function checkBossCityFilter(job, cfg) {
+    const known = BOSS_CITY_PRESETS;
+    const normalize = (name) => String(name || "").trim().replace(/市$/, "");
+    const entries = String(cfg.searchCities || "").split(/[,，、;；\s]+/).filter(Boolean);
+    if (!entries.length) return "未设置目标城市，请先填写投递城市";
+    const targets = entries.map((entry) => {
+      const parts = entry.split(/[:：]/);
+      const name = normalize(parts[0]);
+      if (parts.length === 2) return /^\d{9}$/.test(parts[1]) ? { name, code: parts[1] } : null;
+      if (/^\d{9}$/.test(entry)) return { code: entry, name: Object.keys(known).find((key) => known[key] === entry) || "" };
+      return /^[\u4e00-\u9fff]+$/.test(name) ? { name, code: known[name] || "" } : null;
+    });
+    if (targets.some((target) => !target)) return "目标城市配置格式错误，请使用城市名称或名称:9位代码";
+    if (targets.some((target) => target.code === "100010000")) return null;
+    const rawCode = job.cityCode ?? job.city ?? job.jobInfo?.cityCode ?? job.jobInfo?.city;
+    const code = /^\d{9}$/.test(String(rawCode || "")) ? String(rawCode) : "";
+    const name = normalize(job.cityName || job.jobInfo?.cityName ||
+      (typeof rawCode === "string" && /^[\u4e00-\u9fff]+$/.test(rawCode) ? rawCode : ""));
+    if (!code && !name) return "岗位工作城市未知，跳过以避免异地投递";
+    const matched = targets.some((target) => {
+      if (code && target.code) return code === target.code;
+      return !!name && !!target.name && name === target.name;
+    });
+    return matched ? null : `工作城市 ${name || code} 不在目标城市（${entries.join("、")}）`;
+  }
+
   function shouldSkip(job, cfg, greetedSet) {
     const jobName = job.jobName || "";
     const titleText = `${jobName} ${job.brandName || ""}`;
+    if (platform === "boss") {
+      const cityReason = checkBossCityFilter(job, cfg);
+      if (cityReason) return cityReason;
+    }
 
     // Boss 打招呼强依赖 securityId，缺失的多为 DOM 残缺数据，直接跳过而非失败
     if (platform === "boss" && !job.securityId)
@@ -1996,23 +2189,18 @@
     if (whitelist.length && !jobNameMatchesAny(jobName, whitelist))
       return "不在白名单（岗位名称不匹配）";
 
-    const minSal = parseSalaryMin(job.salaryDesc);
-    if (minSal > 0 && minSal < cfg.minSalary)
-      return `薪资低于 ${cfg.minSalary}k`;
-
-    const maxSal = parseSalaryMax(job.salaryDesc);
-    if (cfg.minMaxSalary > 0) {
-      if (maxSal > 0 && maxSal < cfg.minMaxSalary)
-        return `最高薪资 ${maxSal}k 低于 ${cfg.minMaxSalary}k`;
-      if (maxSal === 0 && job.salaryDesc) {
-        const parsed = parseSalaryRange(job.salaryDesc);
-        if (parsed.min === 0 && parsed.max === 0)
-          log(`⚠️ 薪资「${job.salaryDesc}」无法解析，已放行`, "warn");
-        else
-          log(
-            `⚠️ 薪资「${job.salaryDesc}」无法解析最高值（已解析最低 ${parsed.min}k），已放行`,
-            "warn",
-          );
+    const rangeMin = cfg.salaryRangeMin;
+    const rangeMax = cfg.salaryRangeMax;
+    if (rangeMax > 0 && rangeMin > rangeMax) return "薪资区间配置错误：最低值不能大于最高值";
+    if (rangeMin > 0 || rangeMax > 0) {
+      const salary = parseSalaryRange(job.salaryDesc, true);
+      if (!Number.isFinite(salary.min) || !Number.isFinite(salary.max) ||
+          salary.min <= 0 || salary.max < salary.min || /[\uE000-\uF8FF]/.test(job.salaryDesc || "")) {
+        return "薪资未公开或无法识别，不能确认与目标区间重叠";
+      }
+      // 两个闭区间有交集即可，0 表示该端不限制。
+      if (salary.max < rangeMin || (rangeMax > 0 && salary.min > rangeMax)) {
+        return `岗位薪资 ${job.salaryDesc} 与目标 ${rangeMin}–${rangeMax || "不限"}K 无重叠`;
       }
     }
 
@@ -2034,12 +2222,12 @@
 
   // ---------- 主流程 ----------
 
-  async function processNext() {
-    if (!state.running) return;
+  async function processNext(generation = runGeneration) {
+    if (!state.running || generation !== runGeneration) return;
     const cfg = loadConfig();
     const greetedSet = loadGreetedSet();
 
-    if (state.success >= cfg.maxCount) {
+    if (cfg.maxCount > 0 && state.success >= cfg.maxCount) {
       log(`已达本次上限 ${cfg.maxCount} 条，自动停止`, "warn");
       stopRun();
       return;
@@ -2047,6 +2235,7 @@
 
     if (state.index >= state.jobs.length) {
       const hasMore = await loadMoreJobsIfNeeded();
+      if (!state.running || generation !== runGeneration) return;
       if (!hasMore) {
         log("所有职位已处理完毕", "success");
         stopRun();
@@ -2058,7 +2247,7 @@
     state.index++;
     updateStats();
 
-    const label = `${job.brandName || ""} · ${job.jobName || ""}`;
+    const label = `${job.brandName || ""} · ${job.jobName || ""}${platform === "boss" ? `（工作城市：${job.cityName || job.cityCode || job.city || "未知"}）` : ""}`;
     const skipReason = shouldSkip(job, cfg, greetedSet);
 
     if (skipReason) {
@@ -2066,30 +2255,41 @@
       state.skip++;
       updateStats();
       await randomDelay(cfg.delayMin, cfg.delayMax);
-      processNext();
+      processNext(generation);
       return;
     }
 
     if (cfg.skipInactive) {
       const active = await checkJobActive(job);
+      if (!state.running || generation !== runGeneration) return;
       if (!active) {
         log(`跳过：${label}（职位/HR 不活跃）`, "warn");
         state.skip++;
         updateStats();
         await randomDelay(cfg.delayMin, cfg.delayMax);
-        processNext();
+        processNext(generation);
         return;
       }
     }
 
     try {
       log(`${meta.actionVerb}：${label}`, "info");
-      await greetJob(job, cfg);
+      const result = await greetJob(job, cfg);
       greetedSet.add(jobKey(job));
       saveGreetedSet(greetedSet);
       state.success++;
       log(`成功：${label}`, "success");
+      if (result?.popupBlocked) {
+        log("本条投递已成功，但弹窗未关闭；已暂停后续投递，请手动点击右上角 × 后再开始", "warn");
+        stopRun();
+        return;
+      }
     } catch (err) {
+      if (platform === "job51" && /成功弹窗未关闭|未确认投递结果/.test(err.message)) {
+        log(err.message, "warn");
+        stopRun();
+        return;
+      }
       const softSkip =
         platform === "boss"
           ? /开聊提醒|开聊|已沟通|重复|不可重复/i.test(err.message)
@@ -2099,11 +2299,16 @@
         state.skip++;
         updateStats();
         await randomDelay(cfg.delayMin, cfg.delayMax);
-        processNext();
+        processNext(generation);
         return;
       }
       state.fail++;
       log(`失败：${label} — ${err.message}`, "error");
+      if (platform === "boss" && (bossEnvBlocked || /超时|网络请求失败|响应解析失败/.test(err.message))) {
+        log("请求已暂停，请确认网页上的沟通结果后再操作", "warn");
+        stopRun();
+        return;
+      }
       if (platform === "boss" && isBossEnvError(err.message)) {
         markBossEnvBlocked(err.message);
         log("检测到环境风控，已自动停止", "error");
@@ -2119,12 +2324,26 @@
 
     updateStats();
     await randomDelay(cfg.delayMin, cfg.delayMax);
-    processNext();
+    processNext(generation);
   }
 
   async function startRun() {
     if (state.running) return;
+    if (platform === "boss") {
+      bossBlockedUntil = Number(localStorage.getItem(BOSS_BLOCK_KEY)) || 0;
+      if (bossBlockedUntil > Date.now()) {
+        showToast(`平台限制暂停中，请在 ${new Date(bossBlockedUntil).toLocaleTimeString()} 后确认网页正常再手动启动`, "warn", 6000);
+        return;
+      }
+      bossEnvBlocked = false;
+    }
+    const generation = ++runGeneration;
     readPanelConfig();
+    const salaryConfig = loadConfig();
+    if (salaryConfig.salaryRangeMax > 0 && salaryConfig.salaryRangeMin > salaryConfig.salaryRangeMax) {
+      showToast("薪资区间最低值不能大于最高值，请修改后开始", "warn", 5000);
+      return;
+    }
 
     const startBtn = document.getElementById("bag-start");
     const stopBtn = document.getElementById("bag-stop");
@@ -2134,12 +2353,25 @@
     showToast("正在扫描职位列表…", "info", 3000);
 
     state.jobs = await scanAndCollectJobs();
+    if (generation !== runGeneration) return;
 
+    if (platform === "boss") {
+      const total = state.jobs.length;
+      state.jobs = state.jobs.filter((job) => job.securityId && job.jobName && (job.encryptJobId || job.encryptId));
+      log(`采集到 ${total} 个职位，其中完整数据 ${state.jobs.length} 个`, "info");
+      if (!state.jobs.length) {
+        logCaptureDiagnostics();
+        log("采集失败，任务未启动。请提供上方两条采集诊断日志，确认是响应监听还是字段解析失败。", "warn");
+        showToast("职位数据采集失败，请查看运行日志中的采集诊断", "warn", 8000);
+        if (startBtn) startBtn.disabled = false;
+        return;
+      }
+    }
     if (!state.jobs.length) {
       const cfg = loadConfig();
       const hint =
         platform === "boss" && cfg.multiKeywordSearch
-          ? "未找到职位：请确认已登录；可点「深度搜岗」或勾选多关键词搜岗后重试"
+          ? "未找到职位：请确认已登录，并手动打开职位列表等待卡片加载"
           : "未找到职位：请确认页面已加载出职位卡片（非「加载中」状态）";
       log(hint, "error");
       showToast(hint, "error", 8000);
@@ -2148,6 +2380,7 @@
     }
 
     state.running = true;
+    state.pagesLoaded = 1;
     state.index = 0;
     state.success = 0;
     state.skip = 0;
@@ -2178,6 +2411,12 @@
 
   /** 清空缓存并执行多关键词深度搜岗（无需手动换搜索词） */
   async function deepSearchJobs() {
+    if (platform === "boss") {
+      await collectBossJobsFromPageOnly("当前页");
+      showToast("已采集当前页职位；更多职位请手动使用网页筛选和翻页", "info", 5000);
+      updateStats();
+      return;
+    }
     if (state.running) {
       showToast("请先停止当前任务", "warn");
       return;
@@ -2222,11 +2461,13 @@
   }
 
   function stopRun() {
+    runGeneration++;
     state.running = false;
     const startBtn = document.getElementById("bag-start");
     const stopBtn = document.getElementById("bag-stop");
     if (startBtn) startBtn.disabled = false;
     if (stopBtn) stopBtn.disabled = true;
+    updateStats();
     log("已停止", "warn");
   }
 
@@ -2239,18 +2480,13 @@
 
   function readPanelConfig() {
     const cfg = {
-      greeting:
-        document.getElementById("bag-greeting")?.value ||
-        DEFAULT_CONFIG.greeting,
-      minSalary:
-        parseInt(document.getElementById("bag-min-salary")?.value, 10) || 0,
-      minMaxSalary:
-        parseInt(document.getElementById("bag-min-max-salary")?.value, 10) || 0,
-      maxCount:
-        parseInt(document.getElementById("bag-max-count")?.value, 10) || 30,
-      maxFetchPages:
-        parseInt(document.getElementById("bag-max-fetch-pages")?.value, 10) ||
-        5,
+      customGreetingEnabled: document.getElementById("bag-custom-greeting-enabled")?.checked === true,
+      greeting: document.getElementById("bag-greeting")?.value ?? DEFAULT_CONFIG.greeting,
+      autoNextPage: document.getElementById("bag-auto-next")?.checked ?? true,
+      salaryRangeMin: Math.max(0, Number(document.getElementById("bag-salary-range-min")?.value) || 0),
+      salaryRangeMax: Math.max(0, Number(document.getElementById("bag-salary-range-max")?.value) || 0),
+      maxCount: parseRunLimit(document.getElementById("bag-max-count")?.value, DEFAULT_CONFIG.maxCount),
+      maxFetchPages: parseRunLimit(document.getElementById("bag-max-fetch-pages")?.value, DEFAULT_CONFIG.maxFetchPages),
       delayMin:
         parseFloat(document.getElementById("bag-delay-min")?.value) || 4,
       delayMax:
@@ -2274,19 +2510,14 @@
       searchCities:
         document.getElementById("bag-search-cities")?.value ??
         DEFAULT_CONFIG.searchCities,
-      multiKeywordSearch:
-        document.getElementById("bag-multi-keyword")?.checked ?? true,
-      pagesPerKeyword:
-        parseInt(document.getElementById("bag-pages-per-keyword")?.value, 10) ||
-        3,
+      multiKeywordSearch: false,
+      pagesPerKeyword: DEFAULT_CONFIG.pagesPerKeyword,
       bossAutoFollowChat:
         platform === "boss"
           ? (document.getElementById("bag-boss-auto-follow")?.checked ?? true)
           : false,
-      searchBusinessDistricts:
-        document.getElementById("bag-business-districts")?.value ?? "",
-      searchSubwayLines:
-        document.getElementById("bag-subway-lines")?.value ?? "",
+      searchBusinessDistricts: "",
+      searchSubwayLines: "",
     };
     saveConfig(cfg);
     return cfg;
@@ -2365,8 +2596,8 @@
     });
     document.addEventListener("mousemove", (e) => {
       if (!dragging) return;
-      panel.style.left = `${e.clientX - offsetX}px`;
-      panel.style.top = `${e.clientY - offsetY}px`;
+      panel.style.left = `${Math.max(8, Math.min(e.clientX - offsetX, window.innerWidth - panel.offsetWidth - 8))}px`;
+      panel.style.top = `${Math.max(8, Math.min(e.clientY - offsetY, window.innerHeight - panel.offsetHeight - 8))}px`;
       panel.style.right = "auto";
     });
     document.addEventListener("mouseup", () => {
@@ -2382,7 +2613,7 @@
     style.textContent = `
       #bag-panel {
         position: fixed; top: 80px; right: 16px; z-index: 2147483647;
-        width: 340px; max-height: 85vh; overflow: auto;
+        width: 340px; max-width: calc(100vw - 24px); max-height: calc(100vh - 96px); overflow: hidden; display: flex; flex-direction: column;
         background: #fff; border-radius: 10px;
         box-shadow: 0 8px 32px rgba(0,0,0,.18);
         font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -2391,7 +2622,7 @@
       #bag-panel * { box-sizing: border-box; }
       #bag-panel .bag-header {
         display: flex; align-items: center; justify-content: space-between;
-        padding: 12px 14px; color: #fff;
+        padding: 12px 14px; color: #fff; flex-shrink: 0;
         border-radius: 10px 10px 0 0; cursor: move; user-select: none;
       }
       #bag-panel .bag-header h3 { margin: 0; font-size: 14px; }
@@ -2399,8 +2630,18 @@
         background: rgba(255,255,255,.2); border: none; color: #fff;
         border-radius: 4px; padding: 2px 8px; cursor: pointer;
       }
-      #bag-panel .bag-body { padding: 12px 14px; display: block; }
-      #bag-panel.collapsed .bag-body { display: none; }
+      #bag-panel .bag-body {
+        padding: 12px 14px; display: block; min-height: 0; overflow-y: auto; overflow-x: hidden;
+        overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: #bccfcb transparent;
+      }
+      #bag-panel .bag-body::-webkit-scrollbar, #bag-panel #bag-log::-webkit-scrollbar { width: 6px; height: 6px; }
+      #bag-panel .bag-body::-webkit-scrollbar-track, #bag-panel #bag-log::-webkit-scrollbar-track { background: transparent; }
+      #bag-panel .bag-body::-webkit-scrollbar-thumb, #bag-panel #bag-log::-webkit-scrollbar-thumb {
+        background: #bccfcb; border-radius: 10px;
+      }
+      #bag-panel .bag-body::-webkit-scrollbar-thumb:hover, #bag-panel #bag-log::-webkit-scrollbar-thumb:hover { background: #8caea7; }
+      #bag-panel #bag-log { scrollbar-width: thin; scrollbar-color: #bccfcb transparent; overscroll-behavior: contain; }
+      #bag-panel[hidden], #bag-fab[hidden] { display: none !important; }
       #bag-panel label { display: block; margin: 8px 0 4px; font-weight: 600; font-size: 12px; }
       #bag-panel input[type=text],
       #bag-panel input[type=number],
@@ -2427,9 +2668,23 @@
         opacity: .5; cursor: not-allowed;
       }
       #bag-stop { background: #ff4d4f; color: #fff; }
-      #bag-clear { background: #f0f0f0; color: #666; flex: 0 0 auto; padding: 8px 12px; }
+      #bag-panel #bag-clear {
+        appearance: none; display: inline-flex; align-items: center; justify-content: center;
+        width: 100%; min-height: 40px; margin-top: 12px; padding: 8px 14px;
+        border: 1px solid #efcaca; border-radius: 8px;
+        background: #fff5f5; color: #a33333;
+        font: inherit; font-size: 13px; font-weight: 500; line-height: 1.4;
+        box-shadow: none; cursor: pointer;
+        transition: background-color .15s, border-color .15s;
+      }
+      #bag-panel #bag-clear:hover { background: #ffe8e8; border-color: #dca2a2; }
+      #bag-panel #bag-clear:active { background: #ffdddd; }
+      #bag-panel #bag-clear:focus-visible { outline: 2px solid #a33333; outline-offset: 3px; }
       #bag-refresh { background: #1677ff; color: #fff; flex: 0 0 auto; padding: 8px 10px; font-size: 12px; }
-      #bag-stats { font-size: 12px; color: #666; margin-bottom: 8px; }
+      #bag-panel #bag-copy-log { width: 100%; margin-top: 8px; padding: 8px 12px; border: 1px solid #cbdedb; border-radius: 8px; background: #f4faf9; color: #375b56; font: inherit; cursor: pointer; }
+      #bag-panel #bag-copy-log:hover { background: #e6f1ef; }
+      #bag-panel #bag-copy-log:focus-visible { outline: 2px solid #16766e; outline-offset: 2px; }
+      #bag-panel #bag-stats { font-size: 11px; color: #666; margin-bottom: 8px; white-space: normal; overflow-wrap: anywhere; line-height: 1.7; font-variant-numeric: tabular-nums; }
       #bag-log {
         max-height: 160px; overflow-y: auto; background: #fafafa;
         border: 1px solid #eee; border-radius: 6px; padding: 6px;
@@ -2440,13 +2695,102 @@
       .bag-log-error { color: #ff4d4f; }
       .bag-log-warn { color: #faad14; }
       .bag-tip { font-size: 11px; color: #999; margin-top: 8px; line-height: 1.6; }
+      #bag-panel .bag-step { border-bottom: 1px solid #e8eeee; padding: 0 0 16px; margin: 0 0 16px; }
+      #bag-panel .bag-step h4 { margin: 0 0 12px; font-size: 14px; color: #16766e; }
+      #bag-panel .bag-advanced summary { cursor: pointer; padding: 10px 0; color: #666; font-weight: 600; }
+      #bag-panel #bag-city-picker { position: relative; width: 100%; margin-bottom: 8px; }
+      #bag-panel #bag-city-summary { display: block; list-style: none; position: relative; padding: 8px 28px 8px 10px; border: 1px solid #cbdedb; border-radius: 6px; background: #fff; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 12px; }
+      #bag-panel #bag-city-summary::-webkit-details-marker { display: none; }
+      #bag-panel #bag-city-summary::after { content: "▾"; position: absolute; right: 10px; }
+      #bag-panel #bag-city-picker[open] > summary::after { content: "▴"; }
+      #bag-panel .bag-city-menu { position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 5; max-height: 260px; overflow-y: auto; overscroll-behavior: contain; padding: 4px; border: 1px solid #cbdedb; border-radius: 8px; background: #fff; box-shadow: 0 6px 18px #0002; scrollbar-width: thin; }
+      #bag-panel .bag-city-custom summary { cursor: pointer; font-size: 12px; padding: 8px 0; color: #667b76; }
+      #bag-panel #bag-city-summary:focus-visible { outline: 2px solid #16766e; outline-offset: 2px; }
+      #bag-panel #bag-hot-cities { margin: 0; }
+      #bag-panel #bag-hot-cities .bag-tip { width: 100%; }
+      #bag-panel #bag-hot-cities button { padding: 5px 10px; border: 1px solid #cbdedb; border-radius: 6px; background: #fff; color: #375b56; cursor: pointer; }
+      #bag-panel #bag-search-cities { min-height: 58px; line-height: 1.6; }
+      #bag-panel .bag-city-heading { width: 100%; font-size: 12px; font-weight: 600; color: #375b56; margin: 4px 0; }
+      #bag-panel .bag-city-grid { display: flex; flex-direction: column; width: 100%; }
+      #bag-panel .bag-city-option { margin: 0; min-height: 34px; padding: 7px 10px; display: flex; align-items: center; gap: 8px; border: 0; border-radius: 4px; background: #fff; font-weight: 400; cursor: pointer; }
+      #bag-panel .bag-city-code { margin-left: auto; color: #84918d; font-size: 11px; font-variant-numeric: tabular-nums; }
+      #bag-panel .bag-city-option:hover { background: #f0f7f5; }
+      #bag-panel .bag-city-option[data-selected="true"] { background: #e4f6f1; border-color: #00a99e; color: #006b63; }
+      #bag-panel .bag-city-option input { margin: 0; accent-color: #009e93; cursor: pointer; }
+      #bag-panel .bag-city-option:focus-within { outline: 2px solid #16766e; outline-offset: -2px; }
+      #bag-panel #bag-city-switches { border-top: 1px solid #e4ecea; padding-top: 12px; margin-top: 12px !important; }
+      #bag-panel #bag-city-switches button { padding: 5px 10px; border: 1px solid #cbdedb; border-radius: 6px; background: #f4faf9; cursor: pointer; }
+      #bag-panel .bag-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+      #bag-panel #bag-deep-search, #bag-panel #bag-refresh { background: #eef4f3 !important; color: #375b56 !important; }
       @keyframes bag-pulse {
         0%, 100% { transform: scale(1); }
         50% { transform: scale(1.05); }
       }
-      #bag-fab { animation: bag-pulse 2s infinite; }
+      #bag-fab { transition: box-shadow .15s, background-color .15s; }
+      #bag-fab:hover { filter: brightness(.96); }
+      #bag-fab:focus-visible { outline: 3px solid #16766e; outline-offset: 3px; }
     `;
     (document.head || document.documentElement).appendChild(style);
+  }
+
+  function setPanelOpen(open) {
+    panelOpen = open;
+    const panel = document.getElementById("bag-panel");
+    const fab = document.getElementById("bag-fab");
+    if (panel) panel.hidden = !open;
+    if (fab) {
+      fab.hidden = open;
+      fab.setAttribute("aria-expanded", String(open));
+    }
+  }
+
+  function makeFabDraggable(fab) {
+    let drag = null;
+    let suppressClick = false;
+    const moveTo = (left, top) => {
+      const rect = fab.getBoundingClientRect();
+      fab.style.left = `${Math.max(8, Math.min(left, window.innerWidth - rect.width - 8))}px`;
+      fab.style.top = `${Math.max(8, Math.min(top, window.innerHeight - rect.height - 8))}px`;
+      fab.style.right = "auto";
+      fab.style.bottom = "auto";
+    };
+    fab.addEventListener("pointerdown", (e) => {
+      if (!e.isPrimary || e.button !== 0) return;
+      const rect = fab.getBoundingClientRect();
+      suppressClick = false;
+      drag = { id: e.pointerId, x: e.clientX, y: e.clientY, left: rect.left, top: rect.top, moved: false };
+      fab.setPointerCapture(e.pointerId);
+    });
+    fab.addEventListener("pointermove", (e) => {
+      if (!drag || e.pointerId !== drag.id) return;
+      const dx = e.clientX - drag.x;
+      const dy = e.clientY - drag.y;
+      if (!drag.moved && Math.hypot(dx, dy) < 5) return;
+      drag.moved = true;
+      fab.style.cursor = "grabbing";
+      moveTo(drag.left + dx, drag.top + dy);
+    });
+    const finish = (e) => {
+      if (!drag || e.pointerId !== drag.id) return;
+      suppressClick = drag.moved;
+      drag = null;
+      fab.style.cursor = "grab";
+      if (fab.hasPointerCapture(e.pointerId)) fab.releasePointerCapture(e.pointerId);
+    };
+    fab.addEventListener("pointerup", finish);
+    fab.addEventListener("pointercancel", finish);
+    fab.addEventListener("lostpointercapture", finish);
+    window.addEventListener("resize", () => {
+      if (!fab.hidden && fab.style.left) {
+        const rect = fab.getBoundingClientRect();
+        moveTo(rect.left, rect.top);
+      }
+    });
+    return (e) => {
+      const skip = suppressClick && e.detail !== 0;
+      suppressClick = false;
+      return skip;
+    };
   }
 
   function createFab() {
@@ -2460,29 +2804,126 @@
       right: "12px",
       bottom: "120px",
       zIndex: "2147483646",
-      padding: "12px 18px",
+      padding: "10px 16px",
       background: meta.theme,
       color: "#fff",
       border: "2px solid #fff",
       borderRadius: "24px",
-      cursor: "pointer",
-      fontSize: "15px",
-      fontWeight: "700",
-      boxShadow: `0 4px 20px ${meta.theme}88`,
-      animation: "bag-pulse 2s infinite",
+      cursor: "grab",
+      touchAction: "none",
+      userSelect: "none",
+      fontSize: "14px",
+      fontWeight: "600",
+      boxShadow: "0 4px 14px rgba(0,0,0,.14)",
     });
+    const consumeDragClick = makeFabDraggable(fab);
     fab.addEventListener("click", (e) => {
       e.stopPropagation();
       e.preventDefault();
-      const panel = document.getElementById("bag-panel");
-      if (!panel) {
-        createPanel();
-        return;
-      }
-      panel.classList.remove("collapsed");
-      panel.style.display = "block";
+      if (consumeDragClick(e)) return;
+      if (!document.getElementById("bag-panel")) createPanel();
+      setPanelOpen(true);
+      document.getElementById("bag-collapse")?.focus();
     });
+    fab.type = "button";
+    fab.setAttribute("aria-controls", "bag-panel");
+    fab.setAttribute("aria-expanded", String(panelOpen));
+    fab.hidden = panelOpen;
     getMountRoot().appendChild(fab);
+  }
+
+  function arrangePanelBySteps(panel) {
+    const body = panel.querySelector(".bag-body");
+    const original = [...body.children];
+    const section = (title) => {
+      const el = document.createElement("section");
+      el.className = "bag-step";
+      const heading = document.createElement("h4");
+      heading.textContent = title;
+      el.appendChild(heading);
+      return el;
+    };
+    const search = section("1 · 设置搜索与目标城市");
+    if (platform === "job51") {
+      const tip = document.createElement("p");
+      tip.className = "bag-tip";
+      tip.textContent = "请在网页上方「工作地点」手动选择城市，再点击网页「搜索」。51job 的城市选择不一定显示在地址栏，插件暂不代选城市；深度搜岗暂不能保证沿用网页城市筛选，请核对职位工作地点。";
+      search.appendChild(tip);
+    }
+    const filters = section("2 · 设置岗位筛选");
+    const settings = section("3 · 设置投递节奏");
+    const run = section("4 · 采集并开始");
+    const result = section("5 · 查看进度与日志");
+    const moveField = (id, target) => {
+      const input = panel.querySelector(`#${id}`);
+      if (!input) return;
+      if (input.parentElement.matches("label")) {
+        target.appendChild(input.parentElement);
+      } else if (input.parentElement.parentElement?.classList.contains("bag-row")) {
+        target.appendChild(input.parentElement);
+      } else {
+        const label = input.previousElementSibling;
+        if (label?.matches("label")) target.appendChild(label);
+        target.appendChild(input);
+      }
+    };
+    ["bag-search-keywords", "bag-city-picker"].forEach((id) => moveField(id, search));
+    const cities = panel.querySelector("#bag-city-switches");
+    if (cities) {
+      const tip = cities.nextElementSibling;
+      search.appendChild(cities);
+      if (tip?.classList.contains("bag-tip")) search.appendChild(tip);
+    }
+    ["bag-salary-range", "bag-whitelist", "bag-blacklist",
+      "bag-job51-guoqi", "bag-job51-yangqi", "bag-job51-waiqi",
+      "bag-exclude-outsourcing", "bag-skip-inactive", "bag-skip-greeted"].forEach((id) => moveField(id, filters));
+    ["bag-custom-greeting", "bag-max-count", "bag-max-fetch-pages", "bag-auto-next", "bag-delay-min", "bag-delay-max", "bag-boss-auto-follow"].forEach((id) => moveField(id, settings));
+    const help = document.createElement("p");
+    help.className = "bag-tip";
+    help.textContent = "配置会自动保存。网页职位加载后，点击采集并开始；也可先单独采集。";
+    run.appendChild(help);
+    const actions = panel.querySelector(".bag-actions");
+    const clear = panel.querySelector("#bag-clear");
+    clear.remove();
+    run.appendChild(actions);
+    actions.querySelector("#bag-start").textContent = "采集并开始";
+    actions.querySelector("#bag-deep-search").textContent = platform === "boss" ? "仅采集职位" : "深度搜岗";
+    actions.querySelector("#bag-refresh").textContent = "刷新列表";
+    result.appendChild(panel.querySelector("#bag-stats"));
+    moveField("bag-log", result);
+    const copyLog = document.createElement("button");
+    copyLog.id = "bag-copy-log";
+    copyLog.type = "button";
+    copyLog.textContent = "复制运行日志";
+    copyLog.addEventListener("click", async () => {
+      const lines = [...result.querySelectorAll(".bag-log-line")].reverse().map((line) => line.textContent);
+      const text = [`${meta.label}助手 v${SCRIPT_VERSION}`, result.querySelector("#bag-stats")?.title || "", ...lines].join("\n");
+      try {
+        await navigator.clipboard.writeText(text);
+        showToast("运行日志已复制", "success", 2500);
+      } catch {
+        const selection = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(result.querySelector("#bag-log"));
+        selection?.removeAllRanges();
+        selection?.addRange(range);
+        showToast("浏览器未允许复制，已选中日志，请手动复制", "warn", 4000);
+      }
+    });
+    result.appendChild(copyLog);
+    const advanced = document.createElement("details");
+    advanced.className = "bag-advanced";
+    const summary = document.createElement("summary");
+    summary.textContent = "诊断与记录管理";
+    advanced.appendChild(summary);
+    // 低频诊断和记录管理统一收起。
+    for (const node of original) {
+      if (node.parentElement !== body) continue;
+      if (node.classList.contains("bag-row") && !node.children.length) { node.remove(); continue; }
+      advanced.appendChild(node);
+    }
+    advanced.appendChild(clear);
+    body.append(search, filters, settings, run, result, advanced);
   }
 
   function createPanel() {
@@ -2493,47 +2934,31 @@
     const bossSearchSection =
       platform === "boss"
         ? `
-        <label>搜索关键词（逗号分隔，多词轮询搜岗）</label>
+        <label>备用搜索关键词（逗号分隔，切换城市时使用首词）</label>
         <input type="text" id="bag-search-keywords" value="${cfg.searchKeywords}" placeholder="前端开发,Vue,React">
-        <div class="bag-row">
-          <div>
-            <label>城市代码</label>
-            <input type="text" id="bag-search-cities" value="${cfg.searchCities}" title="101010100=北京，100010000=全国，可多城市逗号分隔">
+        <label>投递城市（可多选）</label>
+        <details id="bag-city-picker">
+          <summary id="bag-city-summary">请选择投递城市</summary>
+          <div class="bag-city-menu">
+            <div id="bag-hot-cities"></div>
+            <details class="bag-city-custom">
+              <summary>编辑自定义城市</summary>
+              <label for="bag-search-cities">城市名或名称:代码，逗号分隔</label>
+              <textarea id="bag-search-cities" rows="2">${cfg.searchCities}</textarea>
+            </details>
           </div>
-          <div>
-            <label>每词拉取页数</label>
-            <input type="number" id="bag-pages-per-keyword" value="${cfg.pagesPerKeyword}" min="1" max="10">
-          </div>
-        </div>
-        <label class="bag-check"><input type="checkbox" id="bag-multi-keyword" ${cfg.multiKeywordSearch !== false ? "checked" : ""}> 启用多关键词搜岗（推荐，突破推荐页枯竭）</label>
+        </details>
+        <div id="bag-city-switches" style="display:flex;flex-wrap:wrap;gap:6px;margin:8px 0"></div>
+        <div class="bag-tip">全国搜索结果也按此处城市严格过滤；城市未知或不匹配会跳过。保存多个城市后，点击城市按钮切换网页搜索。切换前停止任务；新城市加载后手动点击开始。城市代码可从网页选择城市后的地址栏 city 参数获取。</div>
         <label class="bag-check"><input type="checkbox" id="bag-boss-auto-follow" ${cfg.bossAutoFollowChat !== false ? "checked" : ""}> VIP 自动追聊（打招呼后自动开启）</label>
         <button id="bag-probe-autochat" style="width:100%;margin:4px 0 8px;padding:6px;border:1px solid #722ed1;border-radius:6px;background:#fff;color:#722ed1;cursor:pointer;font-size:12px;">🔍 探测追聊接口（诊断用，无需 DevTools）</button>
-        <div class="bag-row">
-          <div>
-            <label>商圈代码（可选，逗号分隔）</label>
-            <input type="text" id="bag-business-districts" value="${cfg.searchBusinessDistricts || ""}" title="在网页搜索结果页手动选好商圈后，从地址栏 URL 复制 multiBusinessDistrict 参数值">
-          </div>
-          <div>
-            <label>地铁线路代码（可选）</label>
-            <input type="text" id="bag-subway-lines" value="${cfg.searchSubwayLines || ""}" title="同理从 URL 复制 multiSubway 参数值">
-          </div>
-        </div>
-        <div class="bag-tip" style="margin:-4px 0 8px">比城市代码更细的地理筛选，弥补 PC 端没有 App 端 GPS 定位精度的差距。</div>
-        <label>手动添加职位（粘贴 App 上看到的职位链接/ID）</label>
-        <div class="bag-row">
-          <input type="text" id="bag-manual-job-input" placeholder="https://www.zhipin.com/job_detail/xxx.html?...">
-          <button id="bag-manual-job-add" style="flex:0 0 auto;background:${meta.theme};color:#fff;border:none;border-radius:6px;padding:0 12px;cursor:pointer;">添加</button>
-        </div>
         `
         : "";
 
     const platformTip =
       platform === "boss"
-        ? `刷不到岗位时：先点「深度搜岗」，再点「开始」。<br>
-           建议关闭 Boss「个性化推荐」：我的 → 设置 → 个性化推荐。<br>
-           已开 VIP 可勾选「自动追聊」，每次打招呼后自动触发。<br>
-           「优先提醒 Boss」官方已下线，脚本不再提供该功能。<br>
-           间隔建议 ≥8 秒，本次上限 15 条，避免触发风控。`
+        ? `配置好筛选条件后点击「采集并开始」。开启自动翻页后继续加载更多职位，达到页数或投递数量上限停止。<br>
+           遇到平台限制暂停至少 30 分钟，不自动恢复。清记录会移除去重历史，可能导致重复打招呼。`
         : `建议：在 we.51job.com 搜索结果页使用，确保已登录。<br>
            前程无忧为简历投递（非即时聊天），间隔建议 ≥6 秒。<br>
            投递有每日上限，过高频率可能触发限制。<br>
@@ -2553,7 +2978,7 @@
     panel.id = "bag-panel";
     panel.innerHTML = `
       <div class="bag-header" style="background:${meta.theme}">
-        <h3>${meta.label} 自动${meta.actionVerb}</h3>
+        <h3>${meta.label} 自动${meta.actionVerb} · v${SCRIPT_VERSION}</h3>
         <button class="bag-toggle" id="bag-collapse">收起</button>
       </div>
       <div class="bag-body">
@@ -2563,27 +2988,35 @@
           <button id="bag-stop" disabled>停止</button>
           <button id="bag-deep-search" style="background:#722ed1;color:#fff">深度搜岗</button>
           <button id="bag-refresh">刷新职位</button>
-          <button id="bag-clear">清记录</button>
+          <button type="button" id="bag-clear" title="清除本地去重记录，可能导致重复打招呼">清除投递记录</button>
         </div>
         ${bossSearchSection}
-        <label>招呼语/附言（支持 {jobName} {company} {salary}）${platform === "job51" ? "，投递弹窗有附言框时自动填写" : ""}</label>
-        <textarea id="bag-greeting">${cfg.greeting}</textarea>
+        <div id="bag-custom-greeting">
+          <label class="bag-check"><input type="checkbox" role="switch" id="bag-custom-greeting-enabled" ${cfg.customGreetingEnabled ? "checked" : ""}> 启用自定义招呼语 / 附言</label>
+          <div id="bag-greeting-fields" style="display:${cfg.customGreetingEnabled ? "block" : "none"}">
+            <textarea id="bag-greeting" aria-label="自定义招呼语或附言"></textarea>
+            <div class="bag-tip">支持 {jobName}、{company}、{salary}。仅在网站提供对应弹窗时尝试填写或提交，不保证送达；无入口时跳过，正常打招呼与投递继续。</div>
+          </div>
+        </div>
+        <label class="bag-check"><input type="checkbox" id="bag-auto-next" ${cfg.autoNextPage ? "checked" : ""}> 当前页处理完成后自动翻页 / 加载更多</label>
         <div class="bag-row">
-          <div>
-            <label>最低薪资(k)</label>
-            <input type="number" id="bag-min-salary" value="${cfg.minSalary}" min="0">
+          <div id="bag-salary-range">
+            <label>目标月薪区间（K）</label>
+            <div class="bag-row">
+              <div><label for="bag-salary-range-min">最低值</label><input type="number" id="bag-salary-range-min" value="${cfg.salaryRangeMin}" min="0" step="0.5" aria-describedby="bag-salary-hint"></div>
+              <div><label for="bag-salary-range-max">最高值</label><input type="number" id="bag-salary-range-max" value="${cfg.salaryRangeMax}" min="0" step="0.5" aria-describedby="bag-salary-hint"></div>
+            </div>
+            <div id="bag-salary-hint" class="bag-tip">与岗位薪资有重叠就通过，含边界。例如 20–30K 可匹配 17–25K、25–40K。0 表示该端不限，两项均为 0 则不限薪资；开启筛选时跳过面议或无法识别的薪资。</div>
           </div>
           <div>
-            <label>最高薪资下限(k)</label>
-            <input type="number" id="bag-min-max-salary" value="${cfg.minMaxSalary}" min="0" title="排除最高薪资低于此值的岗位，0 表示不限">
+            <label>本次投递上限（0 表示不限）</label>
+            <input type="number" id="bag-max-count" value="${cfg.maxCount}" min="0" step="1">
+            <div class="bag-tip">默认每次 50 条，仅为插件任务上限，不代表平台每日额度；遇到平台限制会停止。</div>
           </div>
           <div>
-            <label>本次上限</label>
-            <input type="number" id="bag-max-count" value="${cfg.maxCount}" min="1">
-          </div>
-          <div>
-            <label>预拉取页数</label>
-            <input type="number" id="bag-max-fetch-pages" value="${cfg.maxFetchPages}" min="1" max="20" title="启动时主动拉取的搜索结果页数">
+            <label>本次最多处理页数（0 表示不限）</label>
+            <input type="number" id="bag-max-fetch-pages" value="${cfg.maxFetchPages}" min="0" step="1" title="含当前页；0 表示不设页数上限">
+            <div class="bag-tip">默认 5 页，含当前页；滚动新增一批算一页。两项上限均填 0 并开启自动翻页，可持续处理；没有新职位、平台限制或手动停止时结束。</div>
           </div>
         </div>
         <div class="bag-row">
@@ -2609,13 +3042,137 @@
         <div class="bag-tip">${platformTip}</div>
       </div>
     `;
+    panel.querySelector("#bag-greeting").value = cfg.greeting;
+    panel.querySelector("#bag-custom-greeting-enabled").addEventListener("change", (event) => {
+      panel.querySelector("#bag-greeting-fields").style.display = event.target.checked ? "block" : "none";
+      readPanelConfig();
+    });
+    arrangePanelBySteps(panel);
     getMountRoot().appendChild(panel);
+    setPanelOpen(panelOpen);
     document.documentElement.setAttribute(meta.dataAttr, SCRIPT_VERSION);
 
     makePanelDraggable(panel);
+    const renderCitySwitches = () => {
+      const host = document.getElementById("bag-city-switches");
+      if (!host) return;
+      host.replaceChildren();
+      const heading = document.createElement("div");
+      heading.className = "bag-city-heading";
+      heading.textContent = "已选城市快捷搜索";
+      host.appendChild(heading);
+      const nationwideButton = document.createElement("button");
+      nationwideButton.type = "button";
+      nationwideButton.textContent = "全国搜索";
+      nationwideButton.title = "搜索全国职位，投递仍按自定义城市筛选";
+      nationwideButton.addEventListener("click", () => {
+        stopRun();
+        readPanelConfig();
+        const url = new URL(location.href);
+        url.pathname = "/web/geek/jobs";
+        url.hash = "";
+        url.searchParams.set("city", "100010000");
+        // 保留关键词、薪资等搜索条件，清除原城市地域与分页参数。
+        for (const key of ["_security_check", "page", "district", "areaBusiness", "businessDistrict", "multiBusinessDistrict", "subway", "multiSubway"]) {
+          url.searchParams.delete(key);
+        }
+        if (!url.searchParams.get("query")) {
+          url.searchParams.set("query", splitKeywords(document.getElementById("bag-search-keywords")?.value || "")[0] || "");
+        }
+        location.assign(url.href);
+      });
+      host.appendChild(nationwideButton);
+      const raw = document.getElementById("bag-search-cities")?.value || "";
+      const cities = [...new Set(raw.split(/[,，、;；\s]+/).filter(Boolean))];
+      const knownCities = BOSS_CITY_PRESETS;
+      for (const entry of cities) {
+        const parts = entry.split(/[:：]/);
+        const city = knownCities[entry] || (parts.length === 2 ? parts[1] : entry);
+        if (!/^\d{9}$/.test(city)) {
+          const hint = document.createElement("span");
+          hint.textContent = `「${entry}」请填写为 城市名称:9位城市代码`;
+          host.appendChild(hint);
+          continue;
+        }
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = Object.keys(knownCities).find((name) => knownCities[name] === city) || (parts.length === 2 ? parts[0] : city);
+        button.addEventListener("click", () => {
+          stopRun();
+          readPanelConfig();
+          const url = new URL("/web/geek/jobs", location.origin);
+          const query = new URLSearchParams(location.search).get("query") ||
+            splitKeywords(document.getElementById("bag-search-keywords")?.value || "")[0] || "";
+          url.searchParams.set("query", query);
+          url.searchParams.set("city", city);
+          location.assign(url.href);
+        });
+        host.appendChild(button);
+      }
+    };
+    const renderHotCities = () => {
+      const host = document.getElementById("bag-hot-cities");
+      const input = document.getElementById("bag-search-cities");
+      if (!host || !input) return;
+      host.replaceChildren();
+      const entries = input.value.split(/[,，、;；\s]+/).filter(Boolean);
+      const summary = document.getElementById("bag-city-summary");
+      if (summary) {
+        const unique = [...new Set(entries)];
+        const names = unique.map((entry) => Object.keys(BOSS_CITY_PRESETS).find((name) => BOSS_CITY_PRESETS[name] === entry) || entry.split(/[:：]/)[0]);
+        summary.textContent = unique.length ? `${names.join("、")}（已选 ${unique.length}）` : "请选择投递城市";
+        summary.title = names.join("、");
+      }
+      const hotNames = Object.keys(BOSS_CITY_PRESETS).filter((name) => name !== "全国");
+      const matches = (entry, name) => entry.replace(/市$/, "") === name || entry === BOSS_CITY_PRESETS[name] || entry.split(/[:：]/)[1] === BOSS_CITY_PRESETS[name];
+      const save = (values) => {
+        input.value = [...new Set(values)].join(",");
+        readPanelConfig();
+        renderCitySwitches();
+        renderHotCities();
+      };
+      const grid = document.createElement("div");
+      grid.className = "bag-city-grid";
+      for (const name of hotNames) {
+        const selected = entries.some((entry) => matches(entry, name));
+        const option = document.createElement("label");
+        option.className = "bag-city-option";
+        option.dataset.selected = String(selected);
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.checked = selected;
+        checkbox.dataset.city = name;
+        checkbox.addEventListener("change", () => {
+          save(checkbox.checked ? [...entries, name] : entries.filter((entry) => !matches(entry, name)));
+          [...host.querySelectorAll("input[data-city]")].find((el) => el.dataset.city === name)?.focus();
+        });
+        const code = document.createElement("span");
+        code.className = "bag-city-code";
+        code.textContent = BOSS_CITY_PRESETS[name];
+        option.append(checkbox, document.createTextNode(name), code);
+        grid.appendChild(option);
+      }
+      host.appendChild(grid);
+    };
+    renderCitySwitches();
+    renderHotCities();
+    const picker = document.getElementById("bag-city-picker");
+    const closePicker = () => {
+      if (!picker) return;
+      picker.open = false;
+      document.getElementById("bag-city-summary")?.focus();
+    };
+    picker?.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); closePicker(); }
+    });
+    document.addEventListener("pointerdown", (e) => {
+      if (picker?.open && !picker.contains(e.target)) picker.open = false;
+    });
+    document.getElementById("bag-search-cities")?.addEventListener("change", () => { renderCitySwitches(); renderHotCities(); });
 
     document.getElementById("bag-collapse").addEventListener("click", () => {
-      panel.classList.toggle("collapsed");
+      setPanelOpen(false);
+      document.getElementById("bag-fab")?.focus();
     });
     document
       .getElementById("bag-start")
@@ -2631,21 +3188,14 @@
       .getElementById("bag-clear")
       .addEventListener("click", clearGreetedHistory);
     document
-      .getElementById("bag-manual-job-add")
-      ?.addEventListener("click", addManualBossJob);
-    document
       .getElementById("bag-probe-autochat")
       ?.addEventListener("click", probeBossAutoChatEndpoints);
-    document
-      .getElementById("bag-manual-job-input")
-      ?.addEventListener("keydown", (e) => {
-        if (e.key === "Enter") addManualBossJob();
-      });
+
 
     [
       "bag-greeting",
-      "bag-min-salary",
-      "bag-min-max-salary",
+      "bag-salary-range-min",
+      "bag-salary-range-max",
       "bag-max-count",
       "bag-max-fetch-pages",
       "bag-delay-min",
@@ -2654,29 +3204,27 @@
       "bag-whitelist",
       "bag-search-keywords",
       "bag-search-cities",
-      "bag-pages-per-keyword",
-      "bag-business-districts",
-      "bag-subway-lines",
     ].forEach((id) => {
-      document.getElementById(id)?.addEventListener("change", readPanelConfig);
+      document.getElementById(id)?.addEventListener("change", () => { readPanelConfig(); updateStats(); });
     });
     [
       "bag-exclude-outsourcing",
       "bag-skip-inactive",
       "bag-skip-greeted",
-      "bag-multi-keyword",
+      "bag-auto-next",
       "bag-boss-auto-follow",
     ].forEach((id) => {
-      document.getElementById(id)?.addEventListener("change", readPanelConfig);
+      document.getElementById(id)?.addEventListener("change", () => { readPanelConfig(); updateStats(); });
     });
     ["bag-job51-guoqi", "bag-job51-yangqi", "bag-job51-waiqi"].forEach((id) => {
-      document.getElementById(id)?.addEventListener("change", readPanelConfig);
+      document.getElementById(id)?.addEventListener("change", () => { readPanelConfig(); updateStats(); });
     });
 
     const loadTip =
       platform === "boss"
-        ? "已加载：刷不到岗位时先点「深度搜岗」，再点「开始」"
+        ? "已加载：先在网页搜索职位，等待列表加载后点击「开始」"
         : "请滚动页面加载职位后点击「开始」";
+    updateStats();
     log(`脚本已加载（${meta.label}），${loadTip}`, "info");
     showToast(
       `✅ ${meta.label}助手 v${SCRIPT_VERSION} 已加载，点右下角按钮打开`,
@@ -2710,6 +3258,8 @@
     setTimeout(() => waitForMount(retry + 1), 250);
   }
 
+  hookNetworkForJobs();
+
   let lastHref = location.href;
   setInterval(() => {
     if (location.href !== lastHref) lastHref = location.href;
@@ -2719,10 +3269,11 @@
   const domWatcher = new MutationObserver(() => {
     if (shouldShowUI() && !document.getElementById("bag-fab")) bootstrap();
   });
-  domWatcher.observe(document.documentElement, {
-    childList: true,
-    subtree: false,
-  });
+  const observeRoot = () => {
+    if (document.documentElement) domWatcher.observe(document.documentElement, { childList: true, subtree: false });
+  };
+  if (document.documentElement) observeRoot();
+  else document.addEventListener("DOMContentLoaded", observeRoot, { once: true });
 
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", bootstrap);
