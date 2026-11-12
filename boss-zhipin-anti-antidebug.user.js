@@ -1,13 +1,15 @@
 // ==UserScript==
 // @name         Boss直聘 反反调试（仅供自查网络请求用）
 // @namespace    https://github.com/songjingyang/boss-zhipin-auto-greet
-// @version      1.0.0
+// @version      1.1.0
 // @description  阻止 Boss 直聘检测到 DevTools 后强制关闭标签页，仅用于自行排查网络请求，不用于绕过其他限制
 // @author       宋璟阳
 // @match        https://www.zhipin.com/*
 // @icon         https://www.zhipin.com/favicon.ico
 // @grant        none
 // @run-at       document-start
+// @updateURL    https://raw.githubusercontent.com/songjingyang/boss-zhipin-auto-greet/main/boss-zhipin-anti-antidebug.user.js
+// @downloadURL  https://raw.githubusercontent.com/songjingyang/boss-zhipin-auto-greet/main/boss-zhipin-anti-antidebug.user.js
 // ==/UserScript==
 
 (function () {
